@@ -1,0 +1,25 @@
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  min-height: 100%;
+}
+
+body {
+  background: #f3f6fb;
+  font-family: Inter, "Segoe UI", Roboto, Arial, sans-serif;
+  overflow-x: auto;
+  overflow-y: auto;
+  color: #243447;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
