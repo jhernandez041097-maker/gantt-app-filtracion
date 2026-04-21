@@ -8,8 +8,6 @@ import {
   addDays,
   applyRangeToCycle,
   arrangeCyclesWithPriority,
-  Cycle,
-  CycleDraft,
   findNextAvailableStart,
   formatDateLabel,
   formatHour,
@@ -25,6 +23,7 @@ import {
   sortCycles,
   toDateInputValue,
 } from "./schedule";
+import type { Cycle, CycleDraft } from "./schedule";
 
 type ModalState =
   | null
@@ -689,7 +688,7 @@ function CycleModal({
         >
           <div style={{ fontSize: 12, color: textSoft, marginBottom: 6 }}>Rango del ciclo</div>
           <div style={{ fontWeight: 700 }}>
-            {formatDateTimeLabel(form.startDate, form.startHour)} -> {formatDateTimeLabel(form.endDate, form.endHour)}
+            {formatDateTimeLabel(form.startDate, form.startHour)} {"->"} {formatDateTimeLabel(form.endDate, form.endHour)}
           </div>
           <div style={{ fontSize: 12, color: textSoft, marginTop: 4 }}>Duracion: {duration}h</div>
         </div>
@@ -1488,7 +1487,7 @@ function AnalysisPanel({
             lineHeight: 1.5,
           }}
         >
-          Rango actual: {formatDateLabel(rangeStartDate)} -> {formatDateLabel(rangeEndDate)}
+          Rango actual: {formatDateLabel(rangeStartDate)} {"->"} {formatDateLabel(rangeEndDate)}
         </div>
 
         <div
@@ -1635,7 +1634,7 @@ function AnalysisPanel({
               >
                 <div style={{ fontWeight: 700, marginBottom: 4 }}>{getCycleDisplayName(cycle)}</div>
                 <div style={{ fontSize: 12, color: textSoft, marginBottom: 8 }}>
-                  {formatDateTimeLabel(cycle.startDate, cycle.startHour)} -> {formatDateTimeLabel(cycle.endDate, cycle.endHour)}
+                  {formatDateTimeLabel(cycle.startDate, cycle.startHour)} {"->"} {formatDateTimeLabel(cycle.endDate, cycle.endHour)}
                 </div>
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                   {issues.map((issue) => (
