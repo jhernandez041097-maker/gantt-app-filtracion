@@ -2,53 +2,50 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
-
-type Cycle = {
-  id: number;
-  weekStart: string;
-  dia: number;
-  horaInicio: number;
-  horaFin: number;
-  producto: string;
-  color: string;
-  aseo: boolean;
-  ccts: string;
-  bbts: string;
-  cantidadHl: string;
-  lineaEnvasado: string;
-  mezcla: boolean;
-  origenMezclaTipo: "" | "bbt" | "cct";
-  origenMezcla: string;
-  proporcionMezcla: string;
-  mantenimientoProgramado: boolean;
-  mantenimientoCorrectivo: boolean;
-  notas: string;
-};
-
-type CycleDraft = Omit<Cycle, "id" | "weekStart">;
+import {
+  DAYS,
+  HOURS,
+  addDays,
+  applyRangeToCycle,
+  arrangeCyclesWithPriority,
+  Cycle,
+  CycleDraft,
+  findNextAvailableStart,
+  formatDateLabel,
+  formatHour,
+  formatWeekLabel,
+  getCycleBounds,
+  getCycleDurationHours,
+  getDayIndexFromDate,
+  getStartOfWeek,
+  getVisibleWeekCycles,
+  getVisibleWeekSegments,
+  rangeFromSlots,
+  slotFromDateHour,
+  sortCycles,
+  toDateInputValue,
+} from "./schedule";
 
 type ModalState =
   | null
   | {
       mode: "create" | "edit";
       cycleId?: number;
-      defaultDia?: number;
-      defaultHora?: number;
+      defaultStartDate?: string;
+      defaultStartHour?: number;
+      defaultEndDate?: string;
+      defaultEndHour?: number;
     };
 
-type DragState = {
-  id: number;
-  startX: number;
-  originalInicio: number;
-  duration: number;
-};
+type InteractionMode = "drag" | "resize-start" | "resize-end";
 
-type ResizeState = {
-  id: number;
-  edge: "left" | "right";
+type InteractionState = {
+  mode: InteractionMode;
+  pointerId: number;
+  cycleId: number;
   startX: number;
-  originalInicio: number;
-  originalFin: number;
+  originalStartSlot: number;
+  originalEndSlot: number;
 };
 
 type ConfigState = {
@@ -73,16 +70,20 @@ type JumpTarget = {
   hour: number;
 };
 
+type NoticeState = null | {
+  message: string;
+  tone: "info" | "success";
+};
+
 type TabKey = "plan" | "analysis" | "admin" | "instructions";
 type PlanViewKey = "week" | "day";
 
-const DAYS = ["LUN", "MAR", "MI\u00c9", "JUE", "VIE", "S\u00c1B", "DOM"];
-const HOURS = Array.from({ length: 24 }, (_, i) => i);
-
-const STORAGE_KEY = "gantt-filtracion-semanal-v2";
+const STORAGE_KEY = "gantt-filtracion-semanal-v3";
+const LEGACY_STORAGE_KEY = "gantt-filtracion-semanal-v2";
 const HOUR_WIDTH_BASE = 56;
 const MIN_ZOOM = 0.4;
 const MAX_ZOOM = 2.2;
+const END_HOUR_OPTIONS = [...HOURS, 24];
 const DEFAULT_CCTS = Array.from({ length: 27 }, (_, index) => `CCT ${index + 1}`);
 const DEFAULT_BBTS = Array.from({ length: 10 }, (_, index) => `BBT ${index + 1}`);
 const DEFAULT_LINEAS_ENVASADO = ["L3 - LATAS", "L4 - ONE WAY", "L5 - RGB"];
@@ -102,72 +103,12 @@ const text = "#243447";
 const textSoft = "#5b6b7f";
 const primary = "#1f6feb";
 const primarySoft = "#e8f1ff";
+const successSoft = "#ecfdf3";
+const successText = "#027a48";
 const danger = "#b91c1c";
-
-function toDateInputValue(date: Date) {
-  const local = new Date(date);
-  local.setMinutes(local.getMinutes() - local.getTimezoneOffset());
-  return local.toISOString().slice(0, 10);
-}
-
-function parseDateValue(value: string) {
-  return new Date(`${value}T00:00:00`);
-}
-
-function getStartOfWeek(date: Date) {
-  const d = new Date(date);
-  const day = d.getDay();
-  const diff = (day === 0 ? -6 : 1) - day;
-  d.setDate(d.getDate() + diff);
-  d.setHours(0, 0, 0, 0);
-  return d.toISOString().split("T")[0];
-}
-
-function addDays(base: string, days: number) {
-  const d = parseDateValue(base);
-  d.setDate(d.getDate() + days);
-  return d.toISOString().split("T")[0];
-}
-
-function getDayIndexFromDate(value: string) {
-  const day = parseDateValue(value).getDay();
-  return day === 0 ? 6 : day - 1;
-}
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
-}
-
-function formatDateFromDate(date: Date) {
-  const day = String(date.getDate()).padStart(2, "0");
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const year = date.getFullYear();
-  return `${day}/${month}/${year}`;
-}
-
-function formatWeekLabel(weekStart: string) {
-  const start = parseDateValue(weekStart);
-  const end = parseDateValue(weekStart);
-  end.setDate(end.getDate() + 6);
-
-  return `${formatDateFromDate(start)} \u2192 ${formatDateFromDate(end)}`;
-}
-
-function formatDayReference(weekStart: string, dayIndex: number) {
-  const date = parseDateValue(addDays(weekStart, dayIndex));
-  return formatDateFromDate(date);
-}
-
-function getCycleDateValue(weekStart: string, dayIndex: number) {
-  return addDays(weekStart, dayIndex);
-}
-
-function formatDateLabel(dateValue: string) {
-  return formatDateFromDate(parseDateValue(dateValue));
-}
-
-function formatHour(hour: number) {
-  return `${String(hour).padStart(2, "0")}:00`;
 }
 
 function parseQuantity(value: string) {
@@ -190,12 +131,9 @@ function normalizeStringList(values: string[]) {
     .filter((value, index, list) => list.indexOf(value) === index);
 }
 
-function readStringArray(value: unknown, fallback: string[] = []) {
-  if (!Array.isArray(value)) return fallback;
-
-  const parsed = value.filter((item): item is string => typeof item === "string");
-  const normalized = normalizeStringList(parsed);
-  return normalized.length > 0 ? normalized : fallback;
+function readStringArrayOrNull(value: unknown) {
+  if (!Array.isArray(value)) return null;
+  return normalizeStringList(value.filter((item): item is string => typeof item === "string"));
 }
 
 function getSelectOptions(options: string[], currentValue: string) {
@@ -203,12 +141,67 @@ function getSelectOptions(options: string[], currentValue: string) {
 }
 
 function buildConfigState(config?: Partial<ConfigState>): ConfigState {
+  const productos = readStringArrayOrNull(config?.productos);
+  const colores = readStringArrayOrNull(config?.colores);
+  const ccts = readStringArrayOrNull(config?.ccts);
+  const bbts = readStringArrayOrNull(config?.bbts);
+  const lineas = readStringArrayOrNull(config?.lineasEnvasado);
+
   return {
-    productos: readStringArray(config?.productos, DEFAULT_CONFIG.productos),
-    colores: readStringArray(config?.colores, DEFAULT_CONFIG.colores),
-    ccts: normalizeStringList([...DEFAULT_CCTS, ...readStringArray(config?.ccts, DEFAULT_CONFIG.ccts)]),
-    bbts: normalizeStringList([...DEFAULT_BBTS, ...readStringArray(config?.bbts, DEFAULT_CONFIG.bbts)]),
-    lineasEnvasado: readStringArray(config?.lineasEnvasado, DEFAULT_CONFIG.lineasEnvasado),
+    productos: productos && productos.length > 0 ? productos : DEFAULT_CONFIG.productos,
+    colores: colores && colores.length > 0 ? colores : DEFAULT_CONFIG.colores,
+    ccts: ccts ?? DEFAULT_CONFIG.ccts,
+    bbts: bbts ?? DEFAULT_CONFIG.bbts,
+    lineasEnvasado: lineas ?? DEFAULT_CONFIG.lineasEnvasado,
+  };
+}
+
+function sanitizeStartHour(value: unknown, fallback: number) {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 23
+    ? value
+    : fallback;
+}
+
+function sanitizeEndHour(value: unknown, fallback: number) {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 24
+    ? value
+    : fallback;
+}
+
+function hydrateCycle(raw: Record<string, unknown>): Cycle {
+  const fallbackStartDate = toDateInputValue(new Date());
+  const legacyWeekStart = typeof raw.weekStart === "string" ? raw.weekStart : getStartOfWeek(new Date());
+  const legacyDayIndex = typeof raw.dia === "number" ? clamp(raw.dia, 0, 6) : 0;
+  const legacyStartDate = addDays(legacyWeekStart, legacyDayIndex);
+
+  const startDate = typeof raw.startDate === "string" ? raw.startDate : legacyStartDate || fallbackStartDate;
+  const startHour = sanitizeStartHour(raw.startHour ?? raw.horaInicio, 6);
+  const startSlot = slotFromDateHour(startDate, startHour);
+
+  const rawEndDate = typeof raw.endDate === "string" ? raw.endDate : startDate;
+  const rawEndHour = sanitizeEndHour(raw.endHour ?? raw.horaFin, Math.min(startHour + 2, 24));
+  const endSlotCandidate = slotFromDateHour(rawEndDate, rawEndHour);
+  const endSlot = endSlotCandidate > startSlot ? endSlotCandidate : startSlot + 1;
+  const normalizedRange = rangeFromSlots(startSlot, endSlot);
+
+  return {
+    id: typeof raw.id === "number" ? raw.id : 0,
+    ...normalizedRange,
+    producto: typeof raw.producto === "string" ? raw.producto : "",
+    color: typeof raw.color === "string" ? raw.color : "#3b82f6",
+    aseo: Boolean(raw.aseo),
+    ccts: typeof raw.ccts === "string" ? raw.ccts : "",
+    bbts: typeof raw.bbts === "string" ? raw.bbts : "",
+    cantidadHl: typeof raw.cantidadHl === "string" ? raw.cantidadHl : "",
+    lineaEnvasado: typeof raw.lineaEnvasado === "string" ? raw.lineaEnvasado : "",
+    mezcla: Boolean(raw.mezcla),
+    origenMezclaTipo:
+      raw.origenMezclaTipo === "bbt" || raw.origenMezclaTipo === "cct" ? raw.origenMezclaTipo : "",
+    origenMezcla: typeof raw.origenMezcla === "string" ? raw.origenMezcla : "",
+    proporcionMezcla: typeof raw.proporcionMezcla === "string" ? raw.proporcionMezcla : "",
+    mantenimientoProgramado: Boolean(raw.mantenimientoProgramado),
+    mantenimientoCorrectivo: Boolean(raw.mantenimientoCorrectivo),
+    notas: typeof raw.notas === "string" ? raw.notas : "",
   };
 }
 
@@ -255,12 +248,17 @@ function getCycleDisplayName(
 
 function createEmptyCycle(
   config: ConfigState,
-  defaults?: Partial<Pick<CycleDraft, "dia" | "horaInicio" | "horaFin">>
+  defaults?: Partial<Pick<CycleDraft, "startDate" | "startHour" | "endDate" | "endHour">>
 ): CycleDraft {
+  const startDate = defaults?.startDate ?? toDateInputValue(new Date());
+  const startHour = defaults?.startHour ?? 6;
+  const fallbackRange = rangeFromSlots(slotFromDateHour(startDate, startHour), slotFromDateHour(startDate, startHour) + 2);
+
   return {
-    dia: defaults?.dia ?? 0,
-    horaInicio: defaults?.horaInicio ?? 6,
-    horaFin: defaults?.horaFin ?? 8,
+    startDate,
+    startHour,
+    endDate: defaults?.endDate ?? fallbackRange.endDate,
+    endHour: defaults?.endHour ?? fallbackRange.endHour,
     producto: config.productos[0] || "",
     color: config.colores[0] || "#3b82f6",
     aseo: false,
@@ -278,75 +276,12 @@ function createEmptyCycle(
   };
 }
 
-function hydrateCycle(raw: Record<string, unknown>): Cycle {
-  return {
-    id: typeof raw.id === "number" ? raw.id : 0,
-    weekStart: typeof raw.weekStart === "string" ? raw.weekStart : getStartOfWeek(new Date()),
-    dia: typeof raw.dia === "number" ? raw.dia : 0,
-    horaInicio: typeof raw.horaInicio === "number" ? raw.horaInicio : 6,
-    horaFin: typeof raw.horaFin === "number" ? raw.horaFin : 8,
-    producto: typeof raw.producto === "string" ? raw.producto : "",
-    color: typeof raw.color === "string" ? raw.color : "#3b82f6",
-    aseo: Boolean(raw.aseo),
-    ccts: typeof raw.ccts === "string" ? raw.ccts : "",
-    bbts: typeof raw.bbts === "string" ? raw.bbts : "",
-    cantidadHl: typeof raw.cantidadHl === "string" ? raw.cantidadHl : "",
-    lineaEnvasado: typeof raw.lineaEnvasado === "string" ? raw.lineaEnvasado : "",
-    mezcla: Boolean(raw.mezcla),
-    origenMezclaTipo:
-      raw.origenMezclaTipo === "bbt" || raw.origenMezclaTipo === "cct" ? raw.origenMezclaTipo : "",
-    origenMezcla: typeof raw.origenMezcla === "string" ? raw.origenMezcla : "",
-    proporcionMezcla: typeof raw.proporcionMezcla === "string" ? raw.proporcionMezcla : "",
-    mantenimientoProgramado: Boolean(raw.mantenimientoProgramado),
-    mantenimientoCorrectivo: Boolean(raw.mantenimientoCorrectivo),
-    notas: typeof raw.notas === "string" ? raw.notas : "",
-  };
-}
-
-function resolveDayCollisions(dayCycles: Cycle[]): Cycle[] {
-  const sorted = [...dayCycles].sort((a, b) => a.horaInicio - b.horaInicio);
-
-  for (let i = 1; i < sorted.length; i++) {
-    const prev = sorted[i - 1];
-    const curr = sorted[i];
-
-    if (curr.horaInicio < prev.horaFin) {
-      const duration = curr.horaFin - curr.horaInicio;
-      curr.horaInicio = prev.horaFin;
-      curr.horaFin = Math.min(24, curr.horaInicio + duration);
-
-      if (curr.horaFin - curr.horaInicio < 1) {
-        curr.horaInicio = 23;
-        curr.horaFin = 24;
-      }
-    }
-  }
-
-  return sorted;
-}
-
-function normalizeWeekCycles(cycles: Cycle[], weekStart: string): Cycle[] {
-  const sameWeek = cycles.filter((c) => c.weekStart === weekStart);
-  const otherWeeks = cycles.filter((c) => c.weekStart !== weekStart);
-
-  const normalized = DAYS.map((_, dayIndex) =>
-    resolveDayCollisions(
-      sameWeek
-        .filter((c) => c.dia === dayIndex)
-        .map((c) => ({ ...c }))
-    )
-  ).flat();
-
-  return [
-    ...otherWeeks,
-    ...sameWeek.map((c) => normalized.find((x) => x.id === c.id) || c),
-  ];
-}
-
 function validateCycle(cycle: CycleDraft) {
-  if (cycle.horaInicio < 0 || cycle.horaInicio > 23) return "Hora inicio invalida.";
-  if (cycle.horaFin < 1 || cycle.horaFin > 24) return "Hora fin invalida.";
-  if (cycle.horaFin <= cycle.horaInicio) return "La hora fin debe ser mayor a la hora inicio.";
+  if (cycle.startHour < 0 || cycle.startHour > 23) return "La hora de inicio es invalida.";
+  if (cycle.endHour < 0 || cycle.endHour > 24) return "La hora de fin es invalida.";
+
+  const { startSlot, endSlot } = getCycleBounds(cycle);
+  if (endSlot <= startSlot) return "La fecha y hora de fin deben ser mayores al inicio.";
 
   if (!isSpecialEventCycle(cycle) && !cycle.producto.trim()) {
     return "Producto requerido.";
@@ -369,10 +304,21 @@ function validateCycle(cycle: CycleDraft) {
   return null;
 }
 
+function formatDateTimeLabel(date: string, hour: number) {
+  return `${formatDateLabel(date)} ${hour === 24 ? "24:00" : formatHour(hour)}`;
+}
+
+function formatHourOption(hour: number) {
+  return hour === 24 ? "24:00" : formatHour(hour);
+}
+
 function formatCycleTooltip(cycle: Cycle) {
+  const duration = getCycleDurationHours(cycle);
   const lines = [
     getCycleDisplayName(cycle),
-    `Horario: ${formatHour(cycle.horaInicio)} - ${formatHour(cycle.horaFin)}`,
+    `Inicio: ${formatDateTimeLabel(cycle.startDate, cycle.startHour)}`,
+    `Fin: ${formatDateTimeLabel(cycle.endDate, cycle.endHour)}`,
+    `Duracion: ${duration}h`,
   ];
 
   if (!isSpecialEventCycle(cycle)) {
@@ -384,6 +330,7 @@ function formatCycleTooltip(cycle: Cycle) {
     if (formatOrigenMezcla(cycle)) lines.push(`Origen mezcla: ${formatOrigenMezcla(cycle)}`);
     if (cycle.proporcionMezcla) lines.push(`Proporcion: ${cycle.proporcionMezcla}`);
   }
+
   if (cycle.notas) lines.push(`Notas: ${cycle.notas}`);
 
   return lines.join("\n");
@@ -405,7 +352,7 @@ function buildUsageMaps(cycles: Cycle[]): UsageMaps {
   };
 
   cycles.forEach((cycle) => {
-    if (!cycle.aseo) {
+    if (!isSpecialEventCycle(cycle)) {
       incrementUsage(usageMaps.productos, cycle.producto);
     }
 
@@ -428,6 +375,9 @@ function buildUsageMaps(cycles: Cycle[]): UsageMaps {
 
 function getCycleIssues(cycle: Cycle) {
   const issues: string[] = [];
+  const duration = getCycleDurationHours(cycle);
+
+  if (duration <= 0) issues.push("Rango horario invalido.");
 
   if (cycle.aseo) {
     if (!cycle.notas.trim()) issues.push("Sin detalle del aseo.");
@@ -440,7 +390,6 @@ function getCycleIssues(cycle: Cycle) {
     if (!cycle.cantidadHl.trim()) issues.push("Sin cantidad (hl).");
     if (!cycle.lineaEnvasado.trim()) issues.push("Sin linea de envasado.");
   }
-  if (cycle.horaFin <= cycle.horaInicio) issues.push("Horario invalido.");
 
   if (!isSpecialEventCycle(cycle) && cycle.mezcla) {
     if (!cycle.origenMezclaTipo) issues.push("Mezcla sin tipo de origen.");
@@ -484,14 +433,14 @@ const inputStyle: React.CSSProperties = {
 };
 
 function StatsBar({ cycles }: { cycles: Cycle[] }) {
-  const totalHoras = cycles.reduce((acc, c) => acc + (c.horaFin - c.horaInicio), 0);
-  const totalHl = cycles.reduce((acc, c) => acc + parseQuantity(c.cantidadHl), 0);
-  const aseos = cycles.filter((c) => c.aseo).length;
+  const totalHoras = cycles.reduce((accumulator, cycle) => accumulator + getCycleDurationHours(cycle), 0);
+  const totalHl = cycles.reduce((accumulator, cycle) => accumulator + parseQuantity(cycle.cantidadHl), 0);
+  const aseos = cycles.filter((cycle) => cycle.aseo).length;
   const productos = [
     ...new Set(
       cycles
-        .filter((c) => !isSpecialEventCycle(c) && c.producto)
-        .map((c) => c.producto)
+        .filter((cycle) => !isSpecialEventCycle(cycle) && cycle.producto)
+        .map((cycle) => cycle.producto)
     ),
   ];
 
@@ -552,7 +501,7 @@ function CycleModal({
 }) {
   const existing =
     openState && openState.mode === "edit"
-      ? cycles.find((c) => c.id === openState.cycleId) || null
+      ? cycles.find((cycle) => cycle.id === openState.cycleId) || null
       : null;
 
   const [form, setForm] = useState<CycleDraft>(() => createEmptyCycle(config));
@@ -562,9 +511,10 @@ function CycleModal({
 
     if (existing) {
       setForm({
-        dia: existing.dia,
-        horaInicio: existing.horaInicio,
-        horaFin: existing.horaFin,
+        startDate: existing.startDate,
+        startHour: existing.startHour,
+        endDate: existing.endDate,
+        endHour: existing.endHour,
         producto: existing.producto,
         color: existing.color,
         aseo: existing.aseo,
@@ -581,13 +531,12 @@ function CycleModal({
         notas: existing.notas,
       });
     } else {
-      const horaInicio = openState.defaultHora ?? 6;
-
       setForm(
         createEmptyCycle(config, {
-          dia: openState.defaultDia ?? 0,
-          horaInicio,
-          horaFin: Math.min(horaInicio + 2, 24),
+          startDate: openState.defaultStartDate,
+          startHour: openState.defaultStartHour,
+          endDate: openState.defaultEndDate,
+          endHour: openState.defaultEndHour,
         })
       );
     }
@@ -596,7 +545,22 @@ function CycleModal({
   if (!openState) return null;
 
   const setField = <K extends keyof CycleDraft>(key: K, value: CycleDraft[K]) => {
-    setForm((prev) => ({ ...prev, [key]: value }));
+    setForm((previous) => ({ ...previous, [key]: value }));
+  };
+
+  const updateRange = (patch: Partial<Pick<CycleDraft, "startDate" | "startHour" | "endDate" | "endHour">>) => {
+    setForm((previous) => {
+      const next = { ...previous, ...patch };
+      const { startSlot, endSlot } = getCycleBounds(next);
+
+      if (endSlot <= startSlot) {
+        const adjusted = rangeFromSlots(startSlot, startSlot + 1);
+        next.endDate = adjusted.endDate;
+        next.endHour = adjusted.endHour;
+      }
+
+      return next;
+    });
   };
 
   const cctsOptions = getSelectOptions(config.ccts, form.ccts);
@@ -610,38 +574,36 @@ function CycleModal({
   const colorOptions = getSelectOptions(config.colores, form.color);
   const defaultProduct = config.productos[0] || "";
   const defaultColor = config.colores[0] || "#3b82f6";
+  const duration = getCycleDurationHours(form);
 
   const handleAseo = (checked: boolean) => {
-    setForm((prev) => ({
-      ...prev,
+    setForm((previous) => ({
+      ...previous,
       aseo: checked,
-      mantenimientoProgramado: checked ? false : prev.mantenimientoProgramado,
-      mantenimientoCorrectivo: checked ? false : prev.mantenimientoCorrectivo,
+      mantenimientoProgramado: checked ? false : previous.mantenimientoProgramado,
+      mantenimientoCorrectivo: checked ? false : previous.mantenimientoCorrectivo,
       producto: checked ? "ASEO" : defaultProduct,
       color: checked ? "#94a3b8" : defaultColor,
-      ccts: checked ? "" : prev.ccts,
-      bbts: checked ? "" : prev.bbts,
-      cantidadHl: checked ? "" : prev.cantidadHl,
-      lineaEnvasado: checked ? "" : prev.lineaEnvasado,
-      mezcla: checked ? false : prev.mezcla,
-      origenMezclaTipo: checked ? "" : prev.origenMezclaTipo,
-      origenMezcla: checked ? "" : prev.origenMezcla,
-      proporcionMezcla: checked ? "" : prev.proporcionMezcla,
+      ccts: checked ? "" : previous.ccts,
+      bbts: checked ? "" : previous.bbts,
+      cantidadHl: checked ? "" : previous.cantidadHl,
+      lineaEnvasado: checked ? "" : previous.lineaEnvasado,
+      mezcla: checked ? false : previous.mezcla,
+      origenMezclaTipo: checked ? "" : previous.origenMezclaTipo,
+      origenMezcla: checked ? "" : previous.origenMezcla,
+      proporcionMezcla: checked ? "" : previous.proporcionMezcla,
     }));
   };
 
-  const handleMaintenanceChange = (
-    type: "preventivo" | "correctivo",
-    checked: boolean
-  ) => {
-    setForm((prev) => {
-      const nextProgramado = type === "preventivo" ? checked : checked ? false : prev.mantenimientoProgramado;
-      const nextCorrectivo = type === "correctivo" ? checked : checked ? false : prev.mantenimientoCorrectivo;
+  const handleMaintenanceChange = (type: "preventivo" | "correctivo", checked: boolean) => {
+    setForm((previous) => {
+      const nextProgramado = type === "preventivo" ? checked : checked ? false : previous.mantenimientoProgramado;
+      const nextCorrectivo = type === "correctivo" ? checked : checked ? false : previous.mantenimientoCorrectivo;
       const nextMaintenanceActive = nextProgramado || nextCorrectivo;
 
       return {
-        ...prev,
-        aseo: nextMaintenanceActive ? false : prev.aseo,
+        ...previous,
+        aseo: nextMaintenanceActive ? false : previous.aseo,
         mantenimientoProgramado: nextProgramado,
         mantenimientoCorrectivo: nextCorrectivo,
         producto: nextMaintenanceActive ? "" : defaultProduct,
@@ -650,24 +612,25 @@ function CycleModal({
             ? "#dc2626"
             : "#f59e0b"
           : defaultColor,
-        ccts: nextMaintenanceActive ? "" : prev.ccts,
-        bbts: nextMaintenanceActive ? "" : prev.bbts,
-        cantidadHl: nextMaintenanceActive ? "" : prev.cantidadHl,
-        lineaEnvasado: nextMaintenanceActive ? "" : prev.lineaEnvasado,
-        mezcla: nextMaintenanceActive ? false : prev.mezcla,
-        origenMezclaTipo: nextMaintenanceActive ? "" : prev.origenMezclaTipo,
-        origenMezcla: nextMaintenanceActive ? "" : prev.origenMezcla,
-        proporcionMezcla: nextMaintenanceActive ? "" : prev.proporcionMezcla,
+        ccts: nextMaintenanceActive ? "" : previous.ccts,
+        bbts: nextMaintenanceActive ? "" : previous.bbts,
+        cantidadHl: nextMaintenanceActive ? "" : previous.cantidadHl,
+        lineaEnvasado: nextMaintenanceActive ? "" : previous.lineaEnvasado,
+        mezcla: nextMaintenanceActive ? false : previous.mezcla,
+        origenMezclaTipo: nextMaintenanceActive ? "" : previous.origenMezclaTipo,
+        origenMezcla: nextMaintenanceActive ? "" : previous.origenMezcla,
+        proporcionMezcla: nextMaintenanceActive ? "" : previous.proporcionMezcla,
       };
     });
   };
 
   const save = () => {
-    const err = validateCycle(form);
-    if (err) {
-      alert(err);
+    const error = validateCycle(form);
+    if (error) {
+      alert(error);
       return;
     }
+
     onSave(form, existing?.id);
   };
 
@@ -687,7 +650,7 @@ function CycleModal({
       <div
         style={{
           ...cardStyle(),
-          width: 680,
+          width: 720,
           maxWidth: "100%",
           maxHeight: "90vh",
           overflowY: "auto",
@@ -700,14 +663,15 @@ function CycleModal({
             justifyContent: "space-between",
             alignItems: "center",
             marginBottom: 18,
+            gap: 12,
           }}
         >
           <div>
             <div style={{ fontSize: 22, fontWeight: 700, color: text }}>
-              {existing ? "Editar ciclo" : "Nuevo ciclo"}
+              {existing ? "Editar ciclo continuo" : "Nuevo ciclo continuo"}
             </div>
             <div style={{ fontSize: 12, color: textSoft }}>
-              Semana: {formatWeekLabel(activeWeekStart)}
+              Semana visible: {formatWeekLabel(activeWeekStart)}
             </div>
           </div>
           <button onClick={onClose} style={{ ...buttonStyle(), padding: "6px 10px" }}>
@@ -715,49 +679,77 @@ function CycleModal({
           </button>
         </div>
 
-        <div style={{ marginBottom: 16 }}>
-          <label style={{ fontSize: 12, color: textSoft }}>Dia</label>
-          <select
-            value={form.dia}
-            onChange={(e) => setField("dia", Number(e.target.value))}
-            style={inputStyle}
-          >
-            {DAYS.map((d, i) => (
-              <option key={d} value={i}>
-                {d}
-              </option>
-            ))}
-          </select>
+        <div
+          style={{
+            ...cardStyle(),
+            padding: 14,
+            marginBottom: 16,
+            background: "#f8fbff",
+          }}
+        >
+          <div style={{ fontSize: 12, color: textSoft, marginBottom: 6 }}>Rango del ciclo</div>
+          <div style={{ fontWeight: 700 }}>
+            {formatDateTimeLabel(form.startDate, form.startHour)} -> {formatDateTimeLabel(form.endDate, form.endHour)}
+          </div>
+          <div style={{ fontSize: 12, color: textSoft, marginTop: 4 }}>Duracion: {duration}h</div>
         </div>
 
-        <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
-          <div style={{ flex: 1 }}>
-            <label style={{ fontSize: 12, color: textSoft }}>Inicio</label>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+            gap: 12,
+            marginBottom: 16,
+          }}
+        >
+          <div>
+            <label style={{ fontSize: 12, color: textSoft }}>Fecha inicio</label>
             <input
-              type="number"
-              min={0}
-              max={23}
-              value={form.horaInicio}
-              onChange={(e) => {
-                const inicio = clamp(Number(e.target.value), 0, 23);
-                setField("horaInicio", inicio);
-                if (form.horaFin <= inicio) setField("horaFin", inicio + 1);
-              }}
+              type="date"
+              value={form.startDate}
+              onChange={(event) => updateRange({ startDate: event.target.value })}
               style={inputStyle}
             />
           </div>
-          <div style={{ flex: 1 }}>
-            <label style={{ fontSize: 12, color: textSoft }}>Fin</label>
+
+          <div>
+            <label style={{ fontSize: 12, color: textSoft }}>Hora inicio</label>
+            <select
+              value={form.startHour}
+              onChange={(event) => updateRange({ startHour: Number(event.target.value) })}
+              style={inputStyle}
+            >
+              {HOURS.map((hour) => (
+                <option key={hour} value={hour}>
+                  {formatHour(hour)}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label style={{ fontSize: 12, color: textSoft }}>Fecha fin</label>
             <input
-              type="number"
-              min={1}
-              max={24}
-              value={form.horaFin}
-              onChange={(e) =>
-                setField("horaFin", clamp(Number(e.target.value), form.horaInicio + 1, 24))
-              }
+              type="date"
+              value={form.endDate}
+              onChange={(event) => updateRange({ endDate: event.target.value })}
               style={inputStyle}
             />
+          </div>
+
+          <div>
+            <label style={{ fontSize: 12, color: textSoft }}>Hora fin</label>
+            <select
+              value={form.endHour}
+              onChange={(event) => updateRange({ endHour: Number(event.target.value) })}
+              style={inputStyle}
+            >
+              {END_HOUR_OPTIONS.map((hour) => (
+                <option key={hour} value={hour}>
+                  {formatHourOption(hour)}
+                </option>
+              ))}
+            </select>
           </div>
         </div>
 
@@ -766,7 +758,7 @@ function CycleModal({
             <input
               type="checkbox"
               checked={form.aseo}
-              onChange={(e) => handleAseo(e.target.checked)}
+              onChange={(event) => handleAseo(event.target.checked)}
             />
             ASEO
           </label>
@@ -774,7 +766,7 @@ function CycleModal({
             <input
               type="checkbox"
               checked={form.mantenimientoProgramado}
-              onChange={(e) => handleMaintenanceChange("preventivo", e.target.checked)}
+              onChange={(event) => handleMaintenanceChange("preventivo", event.target.checked)}
             />
             Mantenimiento preventivo
           </label>
@@ -782,7 +774,7 @@ function CycleModal({
             <input
               type="checkbox"
               checked={form.mantenimientoCorrectivo}
-              onChange={(e) => handleMaintenanceChange("correctivo", e.target.checked)}
+              onChange={(event) => handleMaintenanceChange("correctivo", event.target.checked)}
             />
             Mantenimiento correctivo
           </label>
@@ -793,13 +785,13 @@ function CycleModal({
             <label style={{ fontSize: 12, color: textSoft }}>Producto</label>
             <select
               value={form.producto}
-              onChange={(e) => setField("producto", e.target.value)}
+              onChange={(event) => setField("producto", event.target.value)}
               style={inputStyle}
             >
               <option value="">Seleccionar...</option>
-              {config.productos.map((p) => (
-                <option key={p} value={p}>
-                  {p}
+              {config.productos.map((product) => (
+                <option key={product} value={product}>
+                  {product}
                 </option>
               ))}
             </select>
@@ -820,7 +812,7 @@ function CycleModal({
                 <label style={{ fontSize: 12, color: textSoft }}>CCTs</label>
                 <select
                   value={form.ccts}
-                  onChange={(e) => setField("ccts", e.target.value)}
+                  onChange={(event) => setField("ccts", event.target.value)}
                   style={inputStyle}
                 >
                   <option value="">Seleccionar...</option>
@@ -836,7 +828,7 @@ function CycleModal({
                 <label style={{ fontSize: 12, color: textSoft }}>BBTs</label>
                 <select
                   value={form.bbts}
-                  onChange={(e) => setField("bbts", e.target.value)}
+                  onChange={(event) => setField("bbts", event.target.value)}
                   style={inputStyle}
                 >
                   <option value="">Seleccionar...</option>
@@ -855,7 +847,7 @@ function CycleModal({
                   min={0}
                   step="0.1"
                   value={form.cantidadHl}
-                  onChange={(e) => setField("cantidadHl", e.target.value)}
+                  onChange={(event) => setField("cantidadHl", event.target.value)}
                   placeholder="Ej: 120"
                   style={inputStyle}
                 />
@@ -865,7 +857,7 @@ function CycleModal({
                 <label style={{ fontSize: 12, color: textSoft }}>Linea de envasado</label>
                 <select
                   value={form.lineaEnvasado}
-                  onChange={(e) => setField("lineaEnvasado", e.target.value)}
+                  onChange={(event) => setField("lineaEnvasado", event.target.value)}
                   style={inputStyle}
                 >
                   <option value="">Seleccionar...</option>
@@ -883,13 +875,13 @@ function CycleModal({
                 <input
                   type="checkbox"
                   checked={form.mezcla}
-                  onChange={(e) =>
-                    setForm((prev) => ({
-                      ...prev,
-                      mezcla: e.target.checked,
-                      origenMezclaTipo: e.target.checked ? prev.origenMezclaTipo : "",
-                      origenMezcla: e.target.checked ? prev.origenMezcla : "",
-                      proporcionMezcla: e.target.checked ? prev.proporcionMezcla : "",
+                  onChange={(event) =>
+                    setForm((previous) => ({
+                      ...previous,
+                      mezcla: event.target.checked,
+                      origenMezclaTipo: event.target.checked ? previous.origenMezclaTipo : "",
+                      origenMezcla: event.target.checked ? previous.origenMezcla : "",
+                      proporcionMezcla: event.target.checked ? previous.proporcionMezcla : "",
                     }))
                   }
                 />
@@ -912,14 +904,13 @@ function CycleModal({
               <label style={{ fontSize: 12, color: textSoft }}>Viene de</label>
               <select
                 value={form.origenMezclaTipo}
-                onChange={(e) => {
-                  const value = e.target.value as CycleDraft["origenMezclaTipo"];
-                  setForm((prev) => ({
-                    ...prev,
-                    origenMezclaTipo: value,
+                onChange={(event) =>
+                  setForm((previous) => ({
+                    ...previous,
+                    origenMezclaTipo: event.target.value as CycleDraft["origenMezclaTipo"],
                     origenMezcla: "",
-                  }));
-                }}
+                  }))
+                }
                 style={inputStyle}
               >
                 <option value="">Seleccionar...</option>
@@ -934,7 +925,7 @@ function CycleModal({
               </label>
               <select
                 value={form.origenMezcla}
-                onChange={(e) => setField("origenMezcla", e.target.value)}
+                onChange={(event) => setField("origenMezcla", event.target.value)}
                 style={inputStyle}
                 disabled={!form.origenMezclaTipo}
               >
@@ -951,7 +942,7 @@ function CycleModal({
               <label style={{ fontSize: 12, color: textSoft }}>Proporcion</label>
               <input
                 value={form.proporcionMezcla}
-                onChange={(e) => setField("proporcionMezcla", e.target.value)}
+                onChange={(event) => setField("proporcionMezcla", event.target.value)}
                 placeholder="Ej: 70/30"
                 style={inputStyle}
               />
@@ -979,17 +970,17 @@ function CycleModal({
         <div style={{ marginBottom: 16 }}>
           <label style={{ fontSize: 12, color: textSoft }}>Color</label>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
-            {colorOptions.map((c) => (
+            {colorOptions.map((color) => (
               <button
-                key={c}
+                key={color}
                 type="button"
-                onClick={() => setField("color", c)}
+                onClick={() => setField("color", color)}
                 style={{
                   width: 30,
                   height: 30,
                   borderRadius: "50%",
-                  border: form.color === c ? "3px solid #111827" : "1px solid #cbd5e1",
-                  background: c,
+                  border: form.color === color ? "3px solid #111827" : "1px solid #cbd5e1",
+                  background: color,
                   cursor: "pointer",
                 }}
               />
@@ -1003,10 +994,8 @@ function CycleModal({
           </label>
           <textarea
             value={form.notas}
-            onChange={(e) => setField("notas", e.target.value)}
-            placeholder={
-              specialEventActive ? "Describe la actividad o evento que se realizara..." : ""
-            }
+            onChange={(event) => setField("notas", event.target.value)}
+            placeholder={specialEventActive ? "Describe la actividad o evento que se realizara..." : ""}
             style={{ ...inputStyle, minHeight: 90, resize: "vertical" }}
           />
         </div>
@@ -1015,10 +1004,7 @@ function CycleModal({
           <div>
             {existing && (
               <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                <button
-                  onClick={() => onDuplicate(existing.id)}
-                  style={buttonStyle()}
-                >
+                <button onClick={() => onDuplicate(existing.id)} style={buttonStyle()}>
                   Duplicar
                 </button>
                 <button
@@ -1080,7 +1066,7 @@ function ConfigListSection({
       <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
         <input
           value={value}
-          onChange={(e) => setValue(e.target.value)}
+          onChange={(event) => setValue(event.target.value)}
           placeholder={placeholder}
           style={{ ...inputStyle, marginBottom: 0 }}
         />
@@ -1148,12 +1134,7 @@ function AdminPanel({
 }) {
   const [newColor, setNewColor] = useState("#3b82f6");
 
-  const guardRemoval = (
-    label: string,
-    value: string,
-    usageCount: number,
-    remove: () => void
-  ) => {
+  const guardRemoval = (label: string, value: string, usageCount: number, remove: () => void) => {
     if (usageCount > 0) {
       alert(`No puedes eliminar ${label} "${value}" porque esta en uso en ${usageCount} ciclo(s).`);
       return;
@@ -1170,19 +1151,24 @@ function AdminPanel({
         placeholder="Nuevo producto"
         addLabel="Agregar"
         onAdd={(value) =>
-          setConfig((prev) => ({
-            ...prev,
-            productos: normalizeStringList([...prev.productos, value]),
+          setConfig((previous) => ({
+            ...previous,
+            productos: normalizeStringList([...previous.productos, value]),
           }))
         }
-        onRemove={(value) =>
+        onRemove={(value) => {
+          if (config.productos.length <= 1) {
+            alert("Debe quedar al menos un producto configurado.");
+            return;
+          }
+
           guardRemoval("el producto", value, usageMaps.productos[value] || 0, () =>
-            setConfig((prev) => ({
-              ...prev,
-              productos: prev.productos.filter((item) => item !== value),
+            setConfig((previous) => ({
+              ...previous,
+              productos: previous.productos.filter((item) => item !== value),
             }))
-          )
-        }
+          );
+        }}
         usageMap={usageMaps.productos}
       />
 
@@ -1192,14 +1178,14 @@ function AdminPanel({
           <input
             type="color"
             value={newColor}
-            onChange={(e) => setNewColor(e.target.value)}
+            onChange={(event) => setNewColor(event.target.value)}
             style={{ width: 54, height: 40 }}
           />
           <button
             onClick={() =>
-              setConfig((prev) => ({
-                ...prev,
-                colores: prev.colores.includes(newColor) ? prev.colores : [...prev.colores, newColor],
+              setConfig((previous) => ({
+                ...previous,
+                colores: previous.colores.includes(newColor) ? previous.colores : [...previous.colores, newColor],
               }))
             }
             style={buttonStyle(true)}
@@ -1209,9 +1195,9 @@ function AdminPanel({
         </div>
 
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          {config.colores.map((c) => (
+          {config.colores.map((color) => (
             <span
-              key={c}
+              key={color}
               style={{
                 display: "inline-flex",
                 alignItems: "center",
@@ -1228,12 +1214,12 @@ function AdminPanel({
                   width: 14,
                   height: 14,
                   borderRadius: "50%",
-                  background: c,
+                  background: color,
                   display: "inline-block",
                 }}
               />
-              {c}
-              {(usageMaps.colores[c] || 0) > 0 && (
+              {color}
+              {(usageMaps.colores[color] || 0) > 0 && (
                 <span
                   style={{
                     padding: "2px 8px",
@@ -1244,20 +1230,25 @@ function AdminPanel({
                     fontWeight: 700,
                   }}
                 >
-                  En uso: {usageMaps.colores[c]}
+                  En uso: {usageMaps.colores[color]}
                 </span>
               )}
               <button
-                onClick={() =>
-                  guardRemoval("el color", c, usageMaps.colores[c] || 0, () =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      colores: prev.colores.filter((x) => x !== c),
+                onClick={() => {
+                  if (config.colores.length <= 1) {
+                    alert("Debe quedar al menos un color configurado.");
+                    return;
+                  }
+
+                  guardRemoval("el color", color, usageMaps.colores[color] || 0, () =>
+                    setConfig((previous) => ({
+                      ...previous,
+                      colores: previous.colores.filter((item) => item !== color),
                     }))
-                  )
-                }
+                  );
+                }}
                 style={{ border: "none", background: "transparent", color: danger, cursor: "pointer" }}
-                title={(usageMaps.colores[c] || 0) > 0 ? "Este color esta en uso en el Gantt." : "Eliminar"}
+                title={(usageMaps.colores[color] || 0) > 0 ? "Este color esta en uso en el Gantt." : "Eliminar"}
               >
                 x
               </button>
@@ -1272,16 +1263,16 @@ function AdminPanel({
         placeholder="Nuevo CCT"
         addLabel="Agregar CCT"
         onAdd={(value) =>
-          setConfig((prev) => ({
-            ...prev,
-            ccts: normalizeStringList([...prev.ccts, value]),
+          setConfig((previous) => ({
+            ...previous,
+            ccts: normalizeStringList([...previous.ccts, value]),
           }))
         }
         onRemove={(value) =>
           guardRemoval("el CCT", value, usageMaps.ccts[value] || 0, () =>
-            setConfig((prev) => ({
-              ...prev,
-              ccts: prev.ccts.filter((item) => item !== value),
+            setConfig((previous) => ({
+              ...previous,
+              ccts: previous.ccts.filter((item) => item !== value),
             }))
           )
         }
@@ -1294,16 +1285,16 @@ function AdminPanel({
         placeholder="Nuevo BBT"
         addLabel="Agregar BBT"
         onAdd={(value) =>
-          setConfig((prev) => ({
-            ...prev,
-            bbts: normalizeStringList([...prev.bbts, value]),
+          setConfig((previous) => ({
+            ...previous,
+            bbts: normalizeStringList([...previous.bbts, value]),
           }))
         }
         onRemove={(value) =>
           guardRemoval("el BBT", value, usageMaps.bbts[value] || 0, () =>
-            setConfig((prev) => ({
-              ...prev,
-              bbts: prev.bbts.filter((item) => item !== value),
+            setConfig((previous) => ({
+              ...previous,
+              bbts: previous.bbts.filter((item) => item !== value),
             }))
           )
         }
@@ -1316,16 +1307,16 @@ function AdminPanel({
         placeholder="Nueva linea"
         addLabel="Agregar linea"
         onAdd={(value) =>
-          setConfig((prev) => ({
-            ...prev,
-            lineasEnvasado: normalizeStringList([...prev.lineasEnvasado, value]),
+          setConfig((previous) => ({
+            ...previous,
+            lineasEnvasado: normalizeStringList([...previous.lineasEnvasado, value]),
           }))
         }
         onRemove={(value) =>
           guardRemoval("la linea", value, usageMaps.lineasEnvasado[value] || 0, () =>
-            setConfig((prev) => ({
-              ...prev,
-              lineasEnvasado: prev.lineasEnvasado.filter((item) => item !== value),
+            setConfig((previous) => ({
+              ...previous,
+              lineasEnvasado: previous.lineasEnvasado.filter((item) => item !== value),
             }))
           )
         }
@@ -1357,20 +1348,28 @@ function AnalysisPanel({
     setFechaHasta(addDays(activeWeekStart, 6));
   }, [activeWeekStart]);
 
+  const [rangeStartDate, rangeEndDate] = fechaDesde <= fechaHasta ? [fechaDesde, fechaHasta] : [fechaHasta, fechaDesde];
+  const rangeStartSlot = slotFromDateHour(rangeStartDate, 0);
+  const rangeEndSlot = slotFromDateHour(addDays(rangeEndDate, 1), 0);
+
   const sourceCycles = useMemo(
     () =>
       cycles.filter((cycle) => {
-        const cycleDate = getCycleDateValue(cycle.weekStart, cycle.dia);
-        const matchesFrom = !fechaDesde || cycleDate >= fechaDesde;
-        const matchesTo = !fechaHasta || cycleDate <= fechaHasta;
-        return matchesFrom && matchesTo;
+        const { startSlot, endSlot } = getCycleBounds(cycle);
+        return startSlot < rangeEndSlot && endSlot > rangeStartSlot;
       }),
-    [cycles, fechaDesde, fechaHasta]
+    [cycles, rangeEndSlot, rangeStartSlot]
   );
 
   const productOptions = useMemo(
     () =>
-      Array.from(new Set(cycles.filter((cycle) => !cycle.aseo && cycle.producto).map((cycle) => cycle.producto))).sort(),
+      Array.from(
+        new Set(
+          cycles
+            .filter((cycle) => !isSpecialEventCycle(cycle) && cycle.producto)
+            .map((cycle) => cycle.producto)
+        )
+      ).sort(),
     [cycles]
   );
 
@@ -1383,10 +1382,9 @@ function AnalysisPanel({
     () =>
       Array.from(
         new Set(
-          cycles.flatMap((cycle) => [
-            cycle.ccts,
-            cycle.origenMezclaTipo === "cct" ? cycle.origenMezcla : "",
-          ]).filter(Boolean)
+          cycles
+            .flatMap((cycle) => [cycle.ccts, cycle.origenMezclaTipo === "cct" ? cycle.origenMezcla : ""])
+            .filter(Boolean)
         )
       ).sort(),
     [cycles]
@@ -1396,10 +1394,9 @@ function AnalysisPanel({
     () =>
       Array.from(
         new Set(
-          cycles.flatMap((cycle) => [
-            cycle.bbts,
-            cycle.origenMezclaTipo === "bbt" ? cycle.origenMezcla : "",
-          ]).filter(Boolean)
+          cycles
+            .flatMap((cycle) => [cycle.bbts, cycle.origenMezclaTipo === "bbt" ? cycle.origenMezcla : ""])
+            .filter(Boolean)
         )
       ).sort(),
     [cycles]
@@ -1412,13 +1409,9 @@ function AnalysisPanel({
         const matchesProducto = !producto || cycle.producto === producto;
         const matchesLinea = !linea || cycle.lineaEnvasado === linea;
         const matchesCct =
-          !cct ||
-          cycle.ccts === cct ||
-          (cycle.origenMezclaTipo === "cct" && cycle.origenMezcla === cct);
+          !cct || cycle.ccts === cct || (cycle.origenMezclaTipo === "cct" && cycle.origenMezcla === cct);
         const matchesBbt =
-          !bbt ||
-          cycle.bbts === bbt ||
-          (cycle.origenMezclaTipo === "bbt" && cycle.origenMezcla === bbt);
+          !bbt || cycle.bbts === bbt || (cycle.origenMezclaTipo === "bbt" && cycle.origenMezcla === bbt);
         const matchesMezcla = !onlyMezcla || cycle.mezcla;
         const matchesAseo = !onlyAseo || cycle.aseo;
         const matchesIssues = !onlyIssues || cycleIssues.length > 0;
@@ -1446,8 +1439,8 @@ function AnalysisPanel({
   );
 
   const issueRows = rowsWithIssues.filter((row) => row.issues.length > 0);
-  const totalHoras = filteredCycles.reduce((acc, cycle) => acc + (cycle.horaFin - cycle.horaInicio), 0);
-  const totalHl = filteredCycles.reduce((acc, cycle) => acc + parseQuantity(cycle.cantidadHl), 0);
+  const totalHoras = filteredCycles.reduce((accumulator, cycle) => accumulator + getCycleDurationHours(cycle), 0);
+  const totalHl = filteredCycles.reduce((accumulator, cycle) => accumulator + parseQuantity(cycle.cantidadHl), 0);
 
   const clearFilters = () => {
     setFechaDesde(activeWeekStart);
@@ -1464,11 +1457,19 @@ function AnalysisPanel({
   return (
     <div style={{ display: "grid", gap: 18 }}>
       <div style={{ ...cardStyle(), padding: 18 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            gap: 12,
+            flexWrap: "wrap",
+            alignItems: "center",
+          }}
+        >
           <div>
             <h3 style={{ margin: 0 }}>Analisis y validaciones</h3>
             <div style={{ fontSize: 12, color: textSoft, marginTop: 4 }}>
-              Filtra ciclos por fecha real para revisar datos, detectar faltantes y validar consistencia.
+              Filtra ciclos por rango real para revisar datos y detectar faltantes.
             </div>
           </div>
           <button onClick={clearFilters} style={buttonStyle()}>
@@ -1487,7 +1488,7 @@ function AnalysisPanel({
             lineHeight: 1.5,
           }}
         >
-          Rango actual: {formatDateLabel(fechaDesde)} {"->"} {formatDateLabel(fechaHasta)}
+          Rango actual: {formatDateLabel(rangeStartDate)} -> {formatDateLabel(rangeEndDate)}
         </div>
 
         <div
@@ -1503,7 +1504,7 @@ function AnalysisPanel({
             <input
               type="date"
               value={fechaDesde}
-              onChange={(e) => setFechaDesde(e.target.value)}
+              onChange={(event) => setFechaDesde(event.target.value)}
               style={inputStyle}
             />
           </div>
@@ -1513,14 +1514,14 @@ function AnalysisPanel({
             <input
               type="date"
               value={fechaHasta}
-              onChange={(e) => setFechaHasta(e.target.value)}
+              onChange={(event) => setFechaHasta(event.target.value)}
               style={inputStyle}
             />
           </div>
 
           <div>
             <label style={{ fontSize: 12, color: textSoft }}>Producto</label>
-            <select value={producto} onChange={(e) => setProducto(e.target.value)} style={inputStyle}>
+            <select value={producto} onChange={(event) => setProducto(event.target.value)} style={inputStyle}>
               <option value="">Todos</option>
               {productOptions.map((option) => (
                 <option key={option} value={option}>
@@ -1532,7 +1533,7 @@ function AnalysisPanel({
 
           <div>
             <label style={{ fontSize: 12, color: textSoft }}>Linea</label>
-            <select value={linea} onChange={(e) => setLinea(e.target.value)} style={inputStyle}>
+            <select value={linea} onChange={(event) => setLinea(event.target.value)} style={inputStyle}>
               <option value="">Todas</option>
               {lineOptions.map((option) => (
                 <option key={option} value={option}>
@@ -1544,7 +1545,7 @@ function AnalysisPanel({
 
           <div>
             <label style={{ fontSize: 12, color: textSoft }}>CCT</label>
-            <select value={cct} onChange={(e) => setCct(e.target.value)} style={inputStyle}>
+            <select value={cct} onChange={(event) => setCct(event.target.value)} style={inputStyle}>
               <option value="">Todos</option>
               {cctOptions.map((option) => (
                 <option key={option} value={option}>
@@ -1556,7 +1557,7 @@ function AnalysisPanel({
 
           <div>
             <label style={{ fontSize: 12, color: textSoft }}>BBT</label>
-            <select value={bbt} onChange={(e) => setBbt(e.target.value)} style={inputStyle}>
+            <select value={bbt} onChange={(event) => setBbt(event.target.value)} style={inputStyle}>
               <option value="">Todos</option>
               {bbtOptions.map((option) => (
                 <option key={option} value={option}>
@@ -1569,15 +1570,15 @@ function AnalysisPanel({
 
         <div style={{ display: "flex", gap: 18, flexWrap: "wrap", marginTop: 14 }}>
           <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
-            <input type="checkbox" checked={onlyMezcla} onChange={(e) => setOnlyMezcla(e.target.checked)} />
+            <input type="checkbox" checked={onlyMezcla} onChange={(event) => setOnlyMezcla(event.target.checked)} />
             Solo mezclas
           </label>
           <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
-            <input type="checkbox" checked={onlyAseo} onChange={(e) => setOnlyAseo(e.target.checked)} />
+            <input type="checkbox" checked={onlyAseo} onChange={(event) => setOnlyAseo(event.target.checked)} />
             Solo aseos
           </label>
           <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
-            <input type="checkbox" checked={onlyIssues} onChange={(e) => setOnlyIssues(e.target.checked)} />
+            <input type="checkbox" checked={onlyIssues} onChange={(event) => setOnlyIssues(event.target.checked)} />
             Solo con validaciones
           </label>
         </div>
@@ -1632,11 +1633,9 @@ function AnalysisPanel({
                   background: "#fffaf5",
                 }}
               >
-                <div style={{ fontWeight: 700, marginBottom: 4 }}>
-                  {getCycleDisplayName(cycle)} | {DAYS[cycle.dia]} | {formatHour(cycle.horaInicio)} - {formatHour(cycle.horaFin)}
-                </div>
+                <div style={{ fontWeight: 700, marginBottom: 4 }}>{getCycleDisplayName(cycle)}</div>
                 <div style={{ fontSize: 12, color: textSoft, marginBottom: 8 }}>
-                  Fecha: {formatDateLabel(getCycleDateValue(cycle.weekStart, cycle.dia))}
+                  {formatDateTimeLabel(cycle.startDate, cycle.startHour)} -> {formatDateTimeLabel(cycle.endDate, cycle.endHour)}
                 </div>
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                   {issues.map((issue) => (
@@ -1664,14 +1663,16 @@ function AnalysisPanel({
       <div style={{ ...cardStyle(), padding: 18 }}>
         <h3 style={{ marginTop: 0 }}>Resultados filtrados</h3>
         <div style={{ overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 900 }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 980 }}>
             <thead>
               <tr style={{ textAlign: "left", borderBottom: `1px solid ${border}` }}>
-                {["Fecha", "Dia", "Horario", "Producto", "CCT", "BBT", "HL", "Linea", "Mantenimiento", "Mezcla"].map((head) => (
-                  <th key={head} style={{ padding: "10px 8px", fontSize: 12, color: textSoft }}>
-                    {head}
-                  </th>
-                ))}
+                {["Inicio", "Fin", "Duracion", "Producto", "CCT", "BBT", "HL", "Linea", "Mantenimiento", "Mezcla"].map(
+                  (header) => (
+                    <th key={header} style={{ padding: "10px 8px", fontSize: 12, color: textSoft }}>
+                      {header}
+                    </th>
+                  )
+                )}
               </tr>
             </thead>
             <tbody>
@@ -1685,12 +1686,12 @@ function AnalysisPanel({
                 rowsWithIssues.map(({ cycle, issues }) => (
                   <tr key={cycle.id} style={{ borderBottom: `1px solid #eef3f8` }}>
                     <td style={{ padding: "10px 8px", fontSize: 13 }}>
-                      {formatDateLabel(getCycleDateValue(cycle.weekStart, cycle.dia))}
+                      {formatDateTimeLabel(cycle.startDate, cycle.startHour)}
                     </td>
-                    <td style={{ padding: "10px 8px", fontSize: 13 }}>{DAYS[cycle.dia]}</td>
                     <td style={{ padding: "10px 8px", fontSize: 13 }}>
-                      {formatHour(cycle.horaInicio)} - {formatHour(cycle.horaFin)}
+                      {formatDateTimeLabel(cycle.endDate, cycle.endHour)}
                     </td>
+                    <td style={{ padding: "10px 8px", fontSize: 13 }}>{getCycleDurationHours(cycle)}h</td>
                     <td style={{ padding: "10px 8px", fontSize: 13 }}>{getCycleDisplayName(cycle)}</td>
                     <td style={{ padding: "10px 8px", fontSize: 13 }}>{cycle.ccts || "-"}</td>
                     <td style={{ padding: "10px 8px", fontSize: 13 }}>{cycle.bbts || "-"}</td>
@@ -1705,7 +1706,11 @@ function AnalysisPanel({
                         .join(" | ") || "-"}
                     </td>
                     <td style={{ padding: "10px 8px", fontSize: 13 }}>
-                      {cycle.mezcla ? `${formatOrigenMezcla(cycle) || "Mezcla"}${cycle.proporcionMezcla ? ` | ${cycle.proporcionMezcla}` : ""}` : "-"}
+                      {cycle.mezcla
+                        ? `${formatOrigenMezcla(cycle) || "Mezcla"}${
+                            cycle.proporcionMezcla ? ` | ${cycle.proporcionMezcla}` : ""
+                          }`
+                        : "-"}
                       {issues.length > 0 && (
                         <div style={{ color: danger, fontSize: 11, marginTop: 4 }}>
                           {issues.length} alerta(s)
@@ -1728,15 +1733,14 @@ function InstructionsPanel() {
     <div style={{ ...cardStyle(), padding: 18 }}>
       <h3 style={{ marginTop: 0 }}>Instrucciones</h3>
       <ul style={{ color: text, lineHeight: 1.7 }}>
-        <li>Haz click en una fila del Gantt para crear un ciclo.</li>
-        <li>Doble click en un bloque para editarlo.</li>
-        <li>Arrastra un bloque para moverlo.</li>
+        <li>Haz click en una fila vacia del Gantt para crear un ciclo continuo.</li>
+        <li>Tap o click sobre un bloque abre el mismo ciclo completo, aunque cruce varios dias.</li>
+        <li>Usa el handle del bloque para moverlo sin interferir con el scroll.</li>
         <li>Usa los bordes del bloque para cambiar inicio o fin.</li>
-        <li>Usa el selector de semana para saltar a una fecha y una hora especifica.</li>
-        <li>Al pasar el cursor por un bloque veras CCTs, BBTs, cantidad y linea.</li>
-        <li>Puedes cambiar entre semanas y cada semana queda guardada.</li>
+        <li>Si un ciclo choca con otros, la app los reacomoda automaticamente hacia adelante.</li>
+        <li>Los ciclos pueden cruzar medianoche y continuar en la siguiente semana.</li>
         <li>Desde Admin puedes manejar productos, colores, CCTs, BBTs y lineas sin tocar codigo.</li>
-        <li>Puedes exportar la semana actual a Excel o PDF.</li>
+        <li>Puedes exportar la semana visible a Excel o PDF.</li>
       </ul>
     </div>
   );
@@ -1751,8 +1755,8 @@ export default function App() {
   const [zoom, setZoom] = useState(1);
   const [modal, setModal] = useState<ModalState>(null);
   const [tab, setTab] = useState<TabKey>("plan");
-  const [dragging, setDragging] = useState<DragState | null>(null);
-  const [resizing, setResizing] = useState<ResizeState | null>(null);
+  const [interaction, setInteraction] = useState<InteractionState | null>(null);
+  const [notice, setNotice] = useState<NoticeState>(null);
   const [weekPickerOpen, setWeekPickerOpen] = useState(false);
   const [navigatorDate, setNavigatorDate] = useState(toDateInputValue(new Date()));
   const [navigatorHour, setNavigatorHour] = useState(new Date().getHours());
@@ -1763,6 +1767,9 @@ export default function App() {
   const nextId = useRef(1);
   const dayScrollRefs = useRef<(HTMLDivElement | null)[]>([]);
   const weekPickerRef = useRef<HTMLDivElement | null>(null);
+  const lastInteractionMovedIdsRef = useRef<number[]>([]);
+  const suppressOpenUntilRef = useRef(0);
+
   const baseHourWidth = HOUR_WIDTH_BASE * zoom;
   const hourWidth =
     planView === "week"
@@ -1770,9 +1777,15 @@ export default function App() {
       : baseHourWidth;
   const dayPanelWidth = 24 * hourWidth;
   const usageMaps = useMemo(() => buildUsageMaps(cycles), [cycles]);
+  const cycleMap = useMemo(() => new Map(cycles.map((cycle) => [cycle.id, cycle] as const)), [cycles]);
+  const visibleWeekCycles = useMemo(() => getVisibleWeekCycles(cycles, activeWeekStart), [cycles, activeWeekStart]);
+  const weekSegments = useMemo(() => getVisibleWeekSegments(cycles, activeWeekStart), [cycles, activeWeekStart]);
 
   useEffect(() => {
-    const saved = localStorage.getItem(STORAGE_KEY);
+    const saved =
+      localStorage.getItem(STORAGE_KEY) ??
+      localStorage.getItem(LEGACY_STORAGE_KEY);
+
     if (!saved) {
       setStorageReady(true);
       return;
@@ -1786,21 +1799,19 @@ export default function App() {
       };
 
       const storedCycles = Array.isArray(parsed.cycles)
-        ? parsed.cycles.map((cycle) => hydrateCycle(cycle))
+        ? sortCycles(parsed.cycles.map((cycle) => hydrateCycle(cycle)))
         : [];
-
       const storedWeekStart =
-        typeof parsed.activeWeekStart === "string" ? parsed.activeWeekStart : getStartOfWeek(new Date());
+        typeof parsed.activeWeekStart === "string" ? getStartOfWeek(parsed.activeWeekStart) : getStartOfWeek(new Date());
 
       setCycles(storedCycles);
       setConfig(buildConfigState(parsed.config));
       setActiveWeekStart(storedWeekStart);
       setNavigatorDate(storedWeekStart);
-
-      const maxId = Math.max(0, ...storedCycles.map((c) => c.id));
-      nextId.current = maxId + 1;
+      nextId.current = Math.max(0, ...storedCycles.map((cycle) => cycle.id)) + 1;
     } catch {
       setCycles([]);
+      setConfig(DEFAULT_CONFIG);
     } finally {
       setStorageReady(true);
     }
@@ -1811,33 +1822,31 @@ export default function App() {
 
     localStorage.setItem(
       STORAGE_KEY,
-        JSON.stringify({
-          cycles,
-          config,
-          activeWeekStart,
-        })
-      );
+      JSON.stringify({
+        cycles,
+        config,
+        activeWeekStart,
+      })
+    );
   }, [cycles, config, activeWeekStart, storageReady]);
 
   useEffect(() => {
-    if (!storageReady) return;
+    if (!notice) return;
 
-    setConfig((prev) => {
-      const normalized = buildConfigState(prev);
-      return JSON.stringify(normalized) === JSON.stringify(prev) ? prev : normalized;
-    });
-  }, [storageReady]);
+    const timeout = window.setTimeout(() => setNotice(null), 2600);
+    return () => window.clearTimeout(timeout);
+  }, [notice]);
 
   useEffect(() => {
     if (!weekPickerOpen) return;
 
-    const handleMouseDown = (event: MouseEvent) => {
+    const handlePointerDown = (event: PointerEvent) => {
       if (weekPickerRef.current?.contains(event.target as Node)) return;
       setWeekPickerOpen(false);
     };
 
-    window.addEventListener("mousedown", handleMouseDown);
-    return () => window.removeEventListener("mousedown", handleMouseDown);
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
   }, [weekPickerOpen]);
 
   useEffect(() => {
@@ -1859,76 +1868,163 @@ export default function App() {
     return () => window.clearTimeout(timeout);
   }, [focusedDay]);
 
-  const weekCycles = useMemo(
-    () => cycles.filter((c) => c.weekStart === activeWeekStart),
-    [cycles, activeWeekStart]
-  );
+  useEffect(() => {
+    if (!interaction) return;
 
-  const createCycle = (dia: number, hora: number) => {
+    const move = (event: PointerEvent) => {
+      if (event.pointerId !== interaction.pointerId) return;
+
+      const delta = Math.round((event.clientX - interaction.startX) / hourWidth);
+
+      setCycles((previous) => {
+        const current = previous.find((cycle) => cycle.id === interaction.cycleId);
+        if (!current) return previous;
+
+        let target = current;
+
+        if (interaction.mode === "drag") {
+          const duration = interaction.originalEndSlot - interaction.originalStartSlot;
+          const nextStart = Math.max(0, interaction.originalStartSlot + delta);
+          target = applyRangeToCycle(current, nextStart, nextStart + duration);
+        } else if (interaction.mode === "resize-start") {
+          const nextStart = Math.max(
+            0,
+            Math.min(interaction.originalStartSlot + delta, interaction.originalEndSlot - 1)
+          );
+          target = applyRangeToCycle(current, nextStart, interaction.originalEndSlot);
+        } else {
+          const nextEnd = Math.max(interaction.originalStartSlot + 1, interaction.originalEndSlot + delta);
+          target = applyRangeToCycle(current, interaction.originalStartSlot, nextEnd);
+        }
+
+        const result = arrangeCyclesWithPriority(
+          [...previous.filter((cycle) => cycle.id !== target.id), target],
+          target
+        );
+        lastInteractionMovedIdsRef.current = result.movedIds;
+        return result.cycles;
+      });
+    };
+
+    const up = (event: PointerEvent) => {
+      if (event.pointerId !== interaction.pointerId) return;
+
+      if (lastInteractionMovedIdsRef.current.length > 0) {
+        setNotice({
+          message: `Se reacomodaron ${lastInteractionMovedIdsRef.current.length} ciclo(s).`,
+          tone: "info",
+        });
+      }
+
+      lastInteractionMovedIdsRef.current = [];
+      setInteraction(null);
+    };
+
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+    };
+  }, [interaction, hourWidth]);
+
+  const pushReflowNotice = (movedCount: number) => {
+    if (movedCount <= 0) return;
+
+    setNotice({
+      message: `Se reacomodaron ${movedCount} ciclo(s).`,
+      tone: "info",
+    });
+  };
+
+  const createCycle = (date: string, hour: number) => {
+    const defaults = rangeFromSlots(slotFromDateHour(date, hour), slotFromDateHour(date, hour) + 2);
     setModal({
       mode: "create",
-      defaultDia: dia,
-      defaultHora: hora,
+      defaultStartDate: defaults.startDate,
+      defaultStartHour: defaults.startHour,
+      defaultEndDate: defaults.endDate,
+      defaultEndHour: defaults.endHour,
     });
   };
 
   const saveCycle = (data: CycleDraft, cycleId?: number) => {
-    if (typeof cycleId === "number") {
-      const updated = cycles.map((c) => (c.id === cycleId ? { ...c, ...data } : c));
-      setCycles(normalizeWeekCycles(updated, activeWeekStart));
-    } else {
-      const updated = [
-        ...cycles,
-        {
-          id: nextId.current++,
-          weekStart: activeWeekStart,
-          ...data,
-        },
-      ];
-      setCycles(normalizeWeekCycles(updated, activeWeekStart));
+    const id = typeof cycleId === "number" ? cycleId : nextId.current;
+    const target: Cycle = {
+      id,
+      ...data,
+    };
+    const result = arrangeCyclesWithPriority(
+      [...cycles.filter((cycle) => cycle.id !== id), target],
+      target
+    );
+
+    if (typeof cycleId !== "number") {
+      nextId.current += 1;
     }
+
+    setCycles(result.cycles);
+    pushReflowNotice(result.movedIds.length);
     setModal(null);
   };
 
   const deleteCycle = (cycleId: number) => {
-    setCycles((prev) => prev.filter((c) => c.id !== cycleId));
+    setCycles((previous) => previous.filter((cycle) => cycle.id !== cycleId));
     setModal(null);
   };
 
   const duplicateCycle = (cycleId: number) => {
-    const original = cycles.find((c) => c.id === cycleId);
+    const original = cycles.find((cycle) => cycle.id === cycleId);
     if (!original) return;
 
-    const newId = nextId.current++;
+    const duration = getCycleDurationHours(original);
+    const { endSlot } = getCycleBounds(original);
+    const nextStart = findNextAvailableStart(cycles, duration, endSlot);
+    const newId = nextId.current;
     const duplicated: Cycle = {
       ...original,
       id: newId,
+      ...rangeFromSlots(nextStart, nextStart + duration),
     };
 
-    setCycles((prev) => normalizeWeekCycles([...prev, duplicated], duplicated.weekStart));
+    nextId.current += 1;
+    setCycles((previous) => sortCycles([...previous, duplicated]));
+    setNotice({
+      message: "Copia creada y ubicada en el siguiente espacio disponible.",
+      tone: "success",
+    });
     setModal({ mode: "edit", cycleId: newId });
   };
 
-  const startDrag = (e: React.MouseEvent, c: Cycle) => {
-    e.stopPropagation();
-    setDragging({
-      id: c.id,
-      startX: e.clientX,
-      originalInicio: c.horaInicio,
-      duration: c.horaFin - c.horaInicio,
+  const startInteraction = (
+    event: React.PointerEvent<HTMLElement>,
+    cycle: Cycle,
+    mode: InteractionMode
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    const { startSlot, endSlot } = getCycleBounds(cycle);
+    suppressOpenUntilRef.current = Date.now() + 250;
+    lastInteractionMovedIdsRef.current = [];
+    setInteraction({
+      mode,
+      pointerId: event.pointerId,
+      cycleId: cycle.id,
+      startX: event.clientX,
+      originalStartSlot: startSlot,
+      originalEndSlot: endSlot,
     });
+
+    event.currentTarget.setPointerCapture?.(event.pointerId);
   };
 
-  const startResize = (e: React.MouseEvent, c: Cycle, edge: "left" | "right") => {
-    e.stopPropagation();
-    e.preventDefault();
-    setResizing({
-      id: c.id,
-      edge,
-      startX: e.clientX,
-      originalInicio: c.horaInicio,
-      originalFin: c.horaFin,
-    });
+  const openCycle = (cycleId: number) => {
+    if (Date.now() < suppressOpenUntilRef.current) return;
+    setModal({ mode: "edit", cycleId });
   };
 
   const goToCurrentWeek = () => {
@@ -1954,7 +2050,7 @@ export default function App() {
   };
 
   const goToDateAndHour = () => {
-    const weekStart = getStartOfWeek(parseDateValue(navigatorDate));
+    const weekStart = getStartOfWeek(navigatorDate);
     const day = getDayIndexFromDate(navigatorDate);
 
     setActiveWeekStart(weekStart);
@@ -1967,132 +2063,75 @@ export default function App() {
     setWeekPickerOpen(false);
   };
 
-  useEffect(() => {
-    const move = (e: MouseEvent) => {
-      if (dragging) {
-        const delta = Math.round((e.clientX - dragging.startX) / hourWidth);
-        const newStart = clamp(dragging.originalInicio + delta, 0, 24 - dragging.duration);
-
-        setCycles((prev) =>
-          normalizeWeekCycles(
-            prev.map((c) =>
-              c.id === dragging.id
-                ? { ...c, horaInicio: newStart, horaFin: newStart + dragging.duration }
-                : c
-            ),
-            activeWeekStart
-          )
-        );
-      }
-
-      if (resizing) {
-        const delta = Math.round((e.clientX - resizing.startX) / hourWidth);
-
-        setCycles((prev) =>
-          normalizeWeekCycles(
-            prev.map((c) => {
-              if (c.id !== resizing.id) return c;
-
-              if (resizing.edge === "left") {
-                const newStart = clamp(resizing.originalInicio + delta, 0, c.horaFin - 1);
-                return { ...c, horaInicio: newStart };
-              }
-
-              const newEnd = clamp(resizing.originalFin + delta, c.horaInicio + 1, 24);
-              return { ...c, horaFin: newEnd };
-            }),
-            activeWeekStart
-          )
-        );
-      }
-    };
-
-    const up = () => {
-      setDragging(null);
-      setResizing(null);
-    };
-
-    window.addEventListener("mousemove", move);
-    window.addEventListener("mouseup", up);
-
-    return () => {
-      window.removeEventListener("mousemove", move);
-      window.removeEventListener("mouseup", up);
-    };
-  }, [dragging, resizing, hourWidth, activeWeekStart]);
-
   const exportExcel = () => {
-    const rows = weekCycles.map((c) => ({
-      Semana: formatWeekLabel(c.weekStart),
-      Fecha: formatDateLabel(getCycleDateValue(c.weekStart, c.dia)),
-      Dia: DAYS[c.dia],
-      Inicio: formatHour(c.horaInicio),
-      Fin: formatHour(c.horaFin),
-      Producto: getCycleDisplayName(c),
-      CCTs: c.ccts,
-      BBTs: c.bbts,
-      "Cantidad (hl)": c.cantidadHl,
-      "Linea de envasado": c.lineaEnvasado,
-      "Mant. programado": c.mantenimientoProgramado ? "Si" : "No",
-      "Mant. correctivo": c.mantenimientoCorrectivo ? "Si" : "No",
-      Mezcla: c.mezcla ? "Si" : "No",
-      "Origen mezcla": formatOrigenMezcla(c),
-      Proporcion: c.proporcionMezcla,
-      Aseo: c.aseo ? "Si" : "No",
-      Notas: c.notas,
+    const rows = visibleWeekCycles.map((cycle) => ({
+      "Inicio fecha": formatDateLabel(cycle.startDate),
+      "Inicio hora": formatHour(cycle.startHour),
+      "Fin fecha": formatDateLabel(cycle.endDate),
+      "Fin hora": formatHour(cycle.endHour),
+      "Duracion (h)": getCycleDurationHours(cycle),
+      Producto: getCycleDisplayName(cycle),
+      CCTs: cycle.ccts,
+      BBTs: cycle.bbts,
+      "Cantidad (hl)": cycle.cantidadHl,
+      "Linea de envasado": cycle.lineaEnvasado,
+      "Mant. programado": cycle.mantenimientoProgramado ? "Si" : "No",
+      "Mant. correctivo": cycle.mantenimientoCorrectivo ? "Si" : "No",
+      Mezcla: cycle.mezcla ? "Si" : "No",
+      "Origen mezcla": formatOrigenMezcla(cycle),
+      Proporcion: cycle.proporcionMezcla,
+      Aseo: cycle.aseo ? "Si" : "No",
+      Notas: cycle.notas,
     }));
 
-    const ws = XLSX.utils.json_to_sheet(rows);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Plan");
-    XLSX.writeFile(wb, `plan_filtracion_${activeWeekStart}.xlsx`);
+    const worksheet = XLSX.utils.json_to_sheet(rows);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Plan");
+    XLSX.writeFile(workbook, `plan_filtracion_${activeWeekStart}.xlsx`);
   };
 
   const exportPDF = () => {
-    const doc = new jsPDF();
-    doc.setFontSize(16);
-    doc.text("PLAN DE PRODUCCION DE FILTRACION CERVECERIA DEL ATLANTICO", 14, 16);
-    doc.setFontSize(11);
-    doc.text(`Semana: ${formatWeekLabel(activeWeekStart)}`, 14, 24);
+    const document = new jsPDF({ orientation: "landscape" });
+    document.setFontSize(16);
+    document.text("PLAN DE PRODUCCION DE FILTRACION CERVECERIA DEL ATLANTICO", 14, 16);
+    document.setFontSize(11);
+    document.text(`Semana visible: ${formatWeekLabel(activeWeekStart)}`, 14, 24);
 
-    autoTable(doc, {
+    autoTable(document, {
       startY: 30,
       head: [[
-        "Dia",
         "Inicio",
         "Fin",
+        "Duracion",
         "Producto",
         "CCTs",
         "BBTs",
         "Cantidad (hl)",
         "Linea",
-        "Mant. prog.",
-        "Mant. corr.",
+        "Mantenimiento",
         "Mezcla",
-        "Origen mezcla",
-        "Proporcion",
-        "Aseo",
       ]],
-      body: weekCycles.map((c) => [
-        DAYS[c.dia],
-        formatHour(c.horaInicio),
-        formatHour(c.horaFin),
-        getCycleDisplayName(c),
-        c.ccts,
-        c.bbts,
-        c.cantidadHl,
-        c.lineaEnvasado,
-        c.mantenimientoProgramado ? "Si" : "No",
-        c.mantenimientoCorrectivo ? "Si" : "No",
-        c.mezcla ? "Si" : "No",
-        formatOrigenMezcla(c),
-        c.proporcionMezcla,
-        c.aseo ? "Si" : "No",
+      body: visibleWeekCycles.map((cycle) => [
+        formatDateTimeLabel(cycle.startDate, cycle.startHour),
+        formatDateTimeLabel(cycle.endDate, cycle.endHour),
+        `${getCycleDurationHours(cycle)}h`,
+        getCycleDisplayName(cycle),
+        cycle.ccts,
+        cycle.bbts,
+        cycle.cantidadHl,
+        cycle.lineaEnvasado,
+        [
+          cycle.mantenimientoProgramado ? "Programado" : "",
+          cycle.mantenimientoCorrectivo ? "Correctivo" : "",
+        ]
+          .filter(Boolean)
+          .join(" | "),
+        cycle.mezcla ? `${formatOrigenMezcla(cycle)} ${cycle.proporcionMezcla}`.trim() : "No",
       ]),
       styles: { fontSize: 8 },
     });
 
-    doc.save(`plan_filtracion_${activeWeekStart}.pdf`);
+    document.save(`plan_filtracion_${activeWeekStart}.pdf`);
   };
 
   const openDayView = (dayIndex: number) => {
@@ -2133,16 +2172,25 @@ export default function App() {
     setNavigatorDate(addDays(activeWeekStart, nextDayIndex));
   };
 
+  const selectedDayDate = addDays(activeWeekStart, selectedDayIndex);
+  const selectedDayStartSlot = slotFromDateHour(selectedDayDate, 0);
+  const selectedDayEndSlot = slotFromDateHour(addDays(selectedDayDate, 1), 0);
   const planSummaryCycles =
     planView === "day"
-      ? weekCycles.filter((cycle) => cycle.dia === selectedDayIndex)
-      : weekCycles;
+      ? visibleWeekCycles.filter((cycle) => {
+          const { startSlot, endSlot } = getCycleBounds(cycle);
+          return startSlot < selectedDayEndSlot && endSlot > selectedDayStartSlot;
+        })
+      : visibleWeekCycles;
 
   const visibleDayIndexes =
     planView === "day" ? [selectedDayIndex] : DAYS.map((_, dayIndex) => dayIndex);
 
   const renderDayPanel = (dayIndex: number) => {
-    const dayCycles = weekCycles.filter((cycle) => cycle.dia === dayIndex);
+    const dayDate = addDays(activeWeekStart, dayIndex);
+    const daySegments = weekSegments
+      .filter((segment) => segment.dayIndex === dayIndex)
+      .sort((left, right) => left.startHour - right.startHour);
 
     return (
       <div
@@ -2172,13 +2220,9 @@ export default function App() {
           }}
         >
           <div>{DAYS[dayIndex]}</div>
-          <div style={{ fontSize: 12, fontWeight: 500, marginTop: 2 }}>
-            {formatDayReference(activeWeekStart, dayIndex)}
-          </div>
+          <div style={{ fontSize: 12, fontWeight: 500, marginTop: 2 }}>{formatDateLabel(dayDate)}</div>
           {planView === "week" && (
-            <div style={{ fontSize: 11, marginTop: 4, opacity: 0.75 }}>
-              Abrir dia
-            </div>
+            <div style={{ fontSize: 11, marginTop: 4, opacity: 0.75 }}>Abrir dia</div>
           )}
         </button>
 
@@ -2190,9 +2234,9 @@ export default function App() {
         >
           <div style={{ minWidth: dayPanelWidth }}>
             <div style={{ display: "flex", borderBottom: `1px solid ${border}` }}>
-              {HOURS.map((h) => (
+              {HOURS.map((hour) => (
                 <div
-                  key={h}
+                  key={hour}
                   style={{
                     width: hourWidth,
                     minWidth: hourWidth,
@@ -2204,7 +2248,7 @@ export default function App() {
                     boxSizing: "border-box",
                   }}
                 >
-                  {formatHour(h)}
+                  {formatHour(hour)}
                 </div>
               ))}
             </div>
@@ -2213,19 +2257,22 @@ export default function App() {
               style={{
                 position: "relative",
                 display: "flex",
-                height: 62,
+                height: 74,
                 cursor: "crosshair",
               }}
-              onMouseDown={(e) => {
-                const rect = e.currentTarget.getBoundingClientRect();
-                const x = e.clientX - rect.left;
+              onClick={(event) => {
+                const target = event.target as HTMLElement;
+                if (target.closest("[data-cycle-segment='true']")) return;
+
+                const rect = event.currentTarget.getBoundingClientRect();
+                const x = event.clientX - rect.left;
                 const hour = clamp(Math.floor(x / hourWidth), 0, 23);
-                createCycle(dayIndex, hour);
+                createCycle(dayDate, hour);
               }}
             >
-              {HOURS.map((h) => (
+              {HOURS.map((hour) => (
                 <div
-                  key={h}
+                  key={hour}
                   style={{
                     width: hourWidth,
                     minWidth: hourWidth,
@@ -2235,97 +2282,143 @@ export default function App() {
                 />
               ))}
 
-              {dayCycles.map((c) => {
-                const showMeta = c.horaFin - c.horaInicio >= 3;
-                const compactMeta = [c.ccts, c.cantidadHl ? `${c.cantidadHl} hl` : "", c.lineaEnvasado]
+              {daySegments.map((segment) => {
+                const cycle = cycleMap.get(segment.cycleId);
+                if (!cycle) return null;
+
+                const showMeta = segment.endHour - segment.startHour >= 4;
+                const compactMeta = [cycle.ccts, cycle.cantidadHl ? `${cycle.cantidadHl} hl` : "", cycle.lineaEnvasado]
                   .filter(Boolean)
                   .join(" | ");
+                const segmentLabel = `${segment.continuesBefore ? "< " : ""}${getCycleDisplayName(cycle)}${
+                  segment.continuesAfter ? " >" : ""
+                }`;
 
                 return (
                   <div
-                    key={c.id}
-                    title={formatCycleTooltip(c)}
-                    onDoubleClick={(e) => {
-                      e.stopPropagation();
-                      setModal({ mode: "edit", cycleId: c.id });
-                    }}
-                    onMouseDown={(e) => startDrag(e, c)}
+                    key={segment.key}
+                    data-cycle-segment="true"
+                    title={formatCycleTooltip(cycle)}
                     style={{
                       position: "absolute",
-                      left: c.horaInicio * hourWidth,
-                      width: (c.horaFin - c.horaInicio) * hourWidth,
+                      left: segment.startHour * hourWidth,
+                      width: Math.max((segment.endHour - segment.startHour) * hourWidth, 18),
                       top: 8,
-                      height: 46,
-                      background: c.color,
+                      height: 58,
+                      background: cycle.color,
                       color: "#fff",
-                      fontSize: 12,
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      borderRadius: 8,
-                      cursor: "grab",
-                      userSelect: "none",
+                      borderRadius: 10,
+                      borderTopLeftRadius: segment.continuesBefore ? 3 : 10,
+                      borderBottomLeftRadius: segment.continuesBefore ? 3 : 10,
+                      borderTopRightRadius: segment.continuesAfter ? 3 : 10,
+                      borderBottomRightRadius: segment.continuesAfter ? 3 : 10,
                       boxShadow: "0 8px 20px rgba(0,0,0,0.12)",
                       overflow: "hidden",
-                      textOverflow: "ellipsis",
                     }}
                   >
-                    <div
-                      onMouseDown={(e) => startResize(e, c, "left")}
+                    <button
+                      type="button"
+                      onPointerDown={(event) => startInteraction(event, cycle, "resize-start")}
+                      onClick={(event) => event.stopPropagation()}
+                      aria-label="Redimensionar inicio"
                       style={{
                         position: "absolute",
                         left: 0,
                         top: 0,
                         bottom: 0,
-                        width: 10,
+                        width: 12,
+                        border: "none",
+                        background: "rgba(15,23,42,0.18)",
                         cursor: "ew-resize",
+                        padding: 0,
                       }}
                     />
 
-                    <div
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        openCycle(cycle.id);
+                      }}
                       style={{
-                        padding: "0 12px",
-                        textAlign: "center",
-                        lineHeight: 1.15,
-                        width: "100%",
-                        overflow: "hidden",
+                        position: "absolute",
+                        inset: 0,
+                        border: "none",
+                        background: "transparent",
+                        color: "inherit",
+                        textAlign: "left",
+                        padding: "10px 18px 10px 30px",
+                        cursor: "pointer",
+                        display: "flex",
+                        flexDirection: "column",
+                        justifyContent: "center",
+                        gap: 4,
                       }}
                     >
-                      <div
+                      <span
                         style={{
                           fontWeight: 700,
                           overflow: "hidden",
-                          whiteSpace: "nowrap",
                           textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
                         }}
                       >
-                        {getCycleDisplayName(c)}
-                      </div>
+                        {segmentLabel}
+                      </span>
                       {showMeta && compactMeta && (
-                        <div
+                        <span
                           style={{
                             fontSize: 10,
                             opacity: 0.95,
-                            marginTop: 3,
                             overflow: "hidden",
-                            whiteSpace: "nowrap",
                             textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
                           }}
                         >
                           {compactMeta}
-                        </div>
+                        </span>
                       )}
-                    </div>
+                    </button>
 
-                    <div
-                      onMouseDown={(e) => startResize(e, c, "right")}
+                    <button
+                      type="button"
+                      onPointerDown={(event) => startInteraction(event, cycle, "drag")}
+                      onClick={(event) => event.stopPropagation()}
+                      aria-label="Mover ciclo"
+                      style={{
+                        position: "absolute",
+                        left: 12,
+                        top: 18,
+                        width: 14,
+                        height: 22,
+                        borderRadius: 7,
+                        border: "none",
+                        background: "rgba(15,23,42,0.28)",
+                        color: "#fff",
+                        fontSize: 10,
+                        fontWeight: 700,
+                        cursor: "grab",
+                        padding: 0,
+                      }}
+                    >
+                      ::
+                    </button>
+
+                    <button
+                      type="button"
+                      onPointerDown={(event) => startInteraction(event, cycle, "resize-end")}
+                      onClick={(event) => event.stopPropagation()}
+                      aria-label="Redimensionar fin"
                       style={{
                         position: "absolute",
                         right: 0,
                         top: 0,
                         bottom: 0,
-                        width: 10,
+                        width: 12,
+                        border: "none",
+                        background: "rgba(15,23,42,0.18)",
                         cursor: "ew-resize",
+                        padding: 0,
                       }}
                     />
                   </div>
@@ -2364,7 +2457,9 @@ export default function App() {
           <div style={{ fontSize: 24, fontWeight: 700 }}>
             PLAN DE PRODUCCION DE FILTRACION CERVECERIA DEL ATLANTICO
           </div>
-          <div style={{ fontSize: 13, color: textSoft }}>Plan semanal con guardado local</div>
+          <div style={{ fontSize: 13, color: textSoft }}>
+            Plan semanal dinamico con ciclos continuos y guardado local
+          </div>
         </div>
 
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
@@ -2420,9 +2515,7 @@ export default function App() {
                   gap: 3,
                 }}
               >
-                <span style={{ fontSize: 11, opacity: weekPickerOpen ? 0.85 : 0.65 }}>
-                  SEMANA VISIBLE
-                </span>
+                <span style={{ fontSize: 11, opacity: weekPickerOpen ? 0.85 : 0.65 }}>SEMANA VISIBLE</span>
                 <span>{formatWeekLabel(activeWeekStart)}</span>
               </button>
 
@@ -2439,12 +2532,9 @@ export default function App() {
                     zIndex: 30,
                   }}
                 >
-                  <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>
-                    Ir a una fecha y hora
-                  </div>
+                  <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Ir a una fecha y hora</div>
                   <div style={{ fontSize: 12, color: textSoft, lineHeight: 1.5 }}>
-                    Selecciona una fecha y la vista abrira su semana correspondiente. La hora sirve
-                    para mover el Gantt directamente a ese tramo.
+                    La vista abrira la semana correspondiente y dejara el foco en la hora seleccionada.
                   </div>
 
                   <div style={{ marginTop: 14 }}>
@@ -2452,7 +2542,7 @@ export default function App() {
                     <input
                       type="date"
                       value={navigatorDate}
-                      onChange={(e) => setNavigatorDate(e.target.value)}
+                      onChange={(event) => setNavigatorDate(event.target.value)}
                       style={inputStyle}
                     />
                   </div>
@@ -2461,7 +2551,7 @@ export default function App() {
                     <label style={{ fontSize: 12, color: textSoft }}>Hora</label>
                     <select
                       value={navigatorHour}
-                      onChange={(e) => setNavigatorHour(Number(e.target.value))}
+                      onChange={(event) => setNavigatorHour(Number(event.target.value))}
                       style={inputStyle}
                     >
                       {HOURS.map((hour) => (
@@ -2486,7 +2576,10 @@ export default function App() {
                     Dia seleccionado: {DAYS[getDayIndexFromDate(navigatorDate)]}
                   </div>
 
-                  <button onClick={goToDateAndHour} style={{ ...buttonStyle(true), marginTop: 14, width: "100%" }}>
+                  <button
+                    onClick={goToDateAndHour}
+                    style={{ ...buttonStyle(true), marginTop: 14, width: "100%" }}
+                  >
                     Ir a fecha y hora
                   </button>
                 </div>
@@ -2514,7 +2607,7 @@ export default function App() {
                       fontWeight: 700,
                     }}
                   >
-                    {DAYS[selectedDayIndex]} | {formatDayReference(activeWeekStart, selectedDayIndex)}
+                    {DAYS[selectedDayIndex]} | {formatDateLabel(selectedDayDate)}
                   </div>
                   <button onClick={goToNextDayView} style={buttonStyle()}>
                     Dia {">"}
@@ -2522,7 +2615,7 @@ export default function App() {
                 </>
               )}
               <button
-                onClick={() => setZoom((z) => clamp(Number((z - 0.1).toFixed(2)), MIN_ZOOM, MAX_ZOOM))}
+                onClick={() => setZoom((value) => clamp(Number((value - 0.1).toFixed(2)), MIN_ZOOM, MAX_ZOOM))}
                 style={buttonStyle()}
               >
                 -
@@ -2531,7 +2624,7 @@ export default function App() {
                 {Math.round(zoom * 100)}%
               </div>
               <button
-                onClick={() => setZoom((z) => clamp(Number((z + 0.1).toFixed(2)), MIN_ZOOM, MAX_ZOOM))}
+                onClick={() => setZoom((value) => clamp(Number((value + 0.1).toFixed(2)), MIN_ZOOM, MAX_ZOOM))}
                 style={buttonStyle()}
               >
                 +
@@ -2544,6 +2637,21 @@ export default function App() {
               </button>
             </div>
           </div>
+
+          {notice && (
+            <div
+              style={{
+                ...cardStyle(),
+                padding: "12px 16px",
+                marginBottom: 16,
+                background: notice.tone === "success" ? successSoft : primarySoft,
+                color: notice.tone === "success" ? successText : primary,
+                fontWeight: 700,
+              }}
+            >
+              {notice.message}
+            </div>
+          )}
 
           <StatsBar cycles={planSummaryCycles} />
 
@@ -2559,17 +2667,17 @@ export default function App() {
               flexWrap: "wrap",
             }}
           >
-            <span>Click en una fila para crear ciclo</span>
+            <span>Click en una fila vacia para crear ciclo</span>
             <span>|</span>
-            <span>Doble click en bloque para editar</span>
+            <span>Click o tap sobre el bloque para editar</span>
             <span>|</span>
-            <span>Arrastra para mover</span>
+            <span>Handle :: para mover</span>
             <span>|</span>
             <span>Bordes para redimensionar</span>
             <span>|</span>
-            <span>Usa la semana visible para saltar a fecha y hora</span>
+            <span>El Gantt reacomoda choques automaticamente</span>
             <span>|</span>
-            <span>Click en el titulo del dia para abrir la vista diaria</span>
+            <span>Los ciclos pueden seguir al dia o semana siguiente</span>
           </div>
 
           {planView === "week" ? (
