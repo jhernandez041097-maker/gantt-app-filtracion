@@ -77,11 +77,22 @@ type NoticeState = null | {
   tone: "info" | "success";
 };
 
+type AuthUser = {
+  id: number;
+  name: string;
+  email: string;
+};
+
+type AuthSession = {
+  token: string;
+  user: AuthUser;
+};
+
 type TabKey = "plan" | "analysis" | "admin" | "instructions";
 type PlanViewKey = "week" | "day";
 
-const STORAGE_KEY = "gantt-filtracion-semanal-v3";
-const LEGACY_STORAGE_KEY = "gantt-filtracion-semanal-v2";
+const AUTH_STORAGE_KEY = "gantt-filtracion-auth-v1";
+const API_BASE_URL = "http://localhost:3001";
 const HOUR_WIDTH_BASE = 56;
 const MIN_ZOOM = 0.4;
 const MAX_ZOOM = 2.2;
@@ -138,6 +149,29 @@ function readStringArrayOrNull(value: unknown) {
   return normalizeStringList(value.filter((item): item is string => typeof item === "string"));
 }
 
+function readStoredAuth() {
+  try {
+    const saved = localStorage.getItem(AUTH_STORAGE_KEY);
+    if (!saved) return null;
+
+    const parsed = JSON.parse(saved) as Partial<AuthSession>;
+    if (!parsed.token || !parsed.user?.email) return null;
+
+    return parsed as AuthSession;
+  } catch {
+    return null;
+  }
+}
+
+async function readApiError(response: Response) {
+  try {
+    const data = await response.json();
+    return typeof data.message === "string" ? data.message : "Ocurrio un error.";
+  } catch {
+    return "Ocurrio un error.";
+  }
+}
+
 function createCycleFillTarget(
   overrides?: Partial<CycleFillTarget>,
   fallbackRange?: Partial<Pick<CycleFillTarget, "startDate" | "startHour" | "endDate" | "endHour">>
@@ -164,7 +198,9 @@ function createCycleFillTarget(
 
   return {
     id: id || `fill-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    cct: typeof overrides?.cct === "string" ? overrides.cct.trim() : "",
     bbt: typeof overrides?.bbt === "string" ? overrides.bbt.trim() : "",
+    cantidadHl: typeof overrides?.cantidadHl === "string" ? overrides.cantidadHl.trim() : "",
     lineas: normalizeStringList(overrides?.lineas ?? []),
     ...normalizedRange,
   };
@@ -190,14 +226,17 @@ function sanitizeCycleFillTargets(
 }
 
 function getMeaningfulCycleFillTargets(fills: CycleFillTarget[]) {
-  return fills.filter((fill) => fill.bbt || fill.lineas.length > 0);
+  return fills.filter((fill) => fill.cct || fill.bbt || fill.cantidadHl || fill.lineas.length > 0);
 }
 
 function getCycleFillSummary(fills: CycleFillTarget[]) {
   const meaningfulFills = getMeaningfulCycleFillTargets(fills);
+  const totalHl = meaningfulFills.reduce((total, fill) => total + parseQuantity(fill.cantidadHl), 0);
 
   return {
+    ccts: normalizeStringList(meaningfulFills.map((fill) => fill.cct)).join(", "),
     bbts: normalizeStringList(meaningfulFills.map((fill) => fill.bbt)).join(", "),
+    cantidadHl: totalHl > 0 ? String(Number(totalHl.toFixed(1))) : "",
     lineaEnvasado: normalizeStringList(meaningfulFills.flatMap((fill) => fill.lineas)).join(", "),
   };
 }
@@ -211,9 +250,9 @@ function formatCycleFillDetails(fills: CycleFillTarget[]) {
       )}`;
       const duration = getFillDurationHours(fill);
 
-      return `${index + 1}. ${fill.bbt || "Sin BBT"} -> ${
+      return `${index + 1}. ${fill.cct || "Sin CCT"} -> ${fill.bbt || "Sin BBT"} -> ${
         fill.lineas.length > 0 ? fill.lineas.join(", ") : "Sin lineas"
-      } | ${fillRange} (${duration}h)`;
+      } | ${fill.cantidadHl ? `${fill.cantidadHl} hl` : "Sin cantidad"} | ${fillRange} (${duration}h)`;
     })
     .join(" | ");
 }
@@ -232,7 +271,9 @@ function syncCycleFillFields(cycle: CycleDraft, options?: { preserveEmptyRows?: 
     ...cycle,
     ...nextRange,
     llenados: fills,
+    ccts: summary.ccts,
     bbts: summary.bbts,
+    cantidadHl: summary.cantidadHl,
     lineaEnvasado: summary.lineaEnvasado,
   };
 }
@@ -266,16 +307,31 @@ function getHydratedCycleFillTargets(
   fallbackRange: Pick<CycleDraft, "startDate" | "startHour" | "endDate" | "endHour">
 ) {
   const storedFills = sanitizeCycleFillTargets(raw.llenados, fallbackRange);
-  if (storedFills.length > 0) return storedFills;
-
   const legacyBbt = typeof raw.bbts === "string" ? raw.bbts.trim() : "";
+  const legacyCct = typeof raw.ccts === "string" ? raw.ccts.trim() : "";
+  const legacyCantidadHl = typeof raw.cantidadHl === "string" ? raw.cantidadHl.trim() : "";
   const legacyLinea = typeof raw.lineaEnvasado === "string" ? raw.lineaEnvasado.trim() : "";
+
+  if (storedFills.length > 0) {
+    const hasStoredCct = storedFills.some((fill) => fill.cct);
+    const hasStoredCantidad = storedFills.some((fill) => fill.cantidadHl);
+
+    return storedFills.map((fill, index) =>
+      createCycleFillTarget({
+        ...fill,
+        cct: fill.cct || (!hasStoredCct ? legacyCct : ""),
+        cantidadHl: fill.cantidadHl || (!hasStoredCantidad && index === 0 ? legacyCantidadHl : ""),
+      })
+    );
+  }
 
   if (!legacyBbt && !legacyLinea) return [];
 
   return [
     createCycleFillTarget({
+      cct: legacyCct,
       bbt: legacyBbt,
+      cantidadHl: legacyCantidadHl,
       lineas: legacyLinea ? [legacyLinea] : [],
     }, fallbackRange),
   ];
@@ -338,10 +394,10 @@ function hydrateCycle(raw: Record<string, unknown>): Cycle {
     producto: typeof raw.producto === "string" ? raw.producto : "",
     color: typeof raw.color === "string" ? raw.color : "#3b82f6",
     aseo: Boolean(raw.aseo),
-    ccts: typeof raw.ccts === "string" ? raw.ccts : "",
+    ccts: fillSummary.ccts,
     llenados,
     bbts: fillSummary.bbts,
-    cantidadHl: typeof raw.cantidadHl === "string" ? raw.cantidadHl : "",
+    cantidadHl: fillSummary.cantidadHl,
     lineaEnvasado: fillSummary.lineaEnvasado,
     mezcla: Boolean(raw.mezcla),
     origenMezclaTipo:
@@ -456,6 +512,14 @@ function validateCycle(cycle: CycleDraft) {
       return "Cada llenado debe tener un BBT seleccionado.";
     }
 
+    if (meaningfulFills.some((fill) => !fill.cct)) {
+      return "Cada llenado debe tener un CCT origen seleccionado.";
+    }
+
+    if (meaningfulFills.some((fill) => parseQuantity(fill.cantidadHl) <= 0)) {
+      return "Cada BBT debe tener una cantidad mayor a cero.";
+    }
+
     if (meaningfulFills.some((fill) => fill.lineas.length === 0)) {
       return "Cada BBT debe estar enlazado al menos a una linea.";
     }
@@ -545,7 +609,7 @@ function buildUsageMaps(cycles: Cycle[]): UsageMaps {
     }
 
     incrementUsage(usageMaps.colores, cycle.color);
-    normalizeStringList([cycle.ccts]).forEach((item) => incrementUsage(usageMaps.ccts, item));
+    normalizeStringList(cycle.llenados.map((fill) => fill.cct)).forEach((item) => incrementUsage(usageMaps.ccts, item));
     normalizeStringList(cycle.llenados.map((fill) => fill.bbt)).forEach((item) => incrementUsage(usageMaps.bbts, item));
     normalizeStringList(cycle.llenados.flatMap((fill) => fill.lineas)).forEach((item) =>
       incrementUsage(usageMaps.lineasEnvasado, item)
@@ -577,6 +641,12 @@ function getCycleIssues(cycle: Cycle) {
     if (!cycle.producto.trim()) issues.push("Sin producto.");
     if (!cycle.ccts.trim()) issues.push("Sin CCT asignado.");
     if (getMeaningfulCycleFillTargets(cycle.llenados).length === 0) issues.push("Sin BBT asignado.");
+    if (cycle.llenados.some((fill) => !fill.cct.trim() && (fill.bbt.trim() || fill.cantidadHl.trim() || fill.lineas.length > 0))) {
+      issues.push("Hay llenados sin CCT origen.");
+    }
+    if (cycle.llenados.some((fill) => fill.bbt.trim() && parseQuantity(fill.cantidadHl) <= 0)) {
+      issues.push("Hay BBTs sin cantidad valida.");
+    }
     if (cycle.llenados.some((fill) => fill.bbt.trim() && fill.lineas.length === 0)) {
       issues.push("Hay BBTs sin lineas asociadas.");
     }
@@ -863,7 +933,6 @@ function CycleModal({
     });
   };
 
-  const cctsOptions = getSelectOptions(config.ccts, form.ccts);
   const lineasOptions = normalizeStringList([...config.lineasEnvasado, ...form.llenados.flatMap((fill) => fill.lineas)]);
   const origenOptions = getSelectOptions(
     form.origenMezclaTipo === "bbt" ? config.bbts : config.ccts,
@@ -1104,39 +1173,17 @@ function CycleModal({
           <>
             <div
               style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                gap: 12,
+                ...cardStyle(),
+                padding: 14,
                 marginBottom: 16,
+                background: "#f8fbff",
               }}
             >
-              <div>
-                <label style={{ fontSize: 12, color: textSoft }}>CCTs</label>
-                <select
-                  value={form.ccts}
-                  onChange={(event) => setField("ccts", event.target.value)}
-                  style={inputStyle}
-                >
-                  <option value="">Seleccionar...</option>
-                  {cctsOptions.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label style={{ fontSize: 12, color: textSoft }}>Cantidad (hl)</label>
-                <input
-                  type="number"
-                  min={0}
-                  step="0.1"
-                  value={form.cantidadHl}
-                  onChange={(event) => setField("cantidadHl", event.target.value)}
-                  placeholder="Ej: 120"
-                  style={inputStyle}
-                />
+              <div style={{ fontSize: 12, color: textSoft, marginBottom: 6 }}>Resumen operativo</div>
+              <div style={{ display: "flex", gap: 12, flexWrap: "wrap", fontSize: 13 }}>
+                <span>CCTs: {form.ccts || "Sin CCTs"}</span>
+                <span>|</span>
+                <span>Total: {form.cantidadHl ? `${form.cantidadHl} hl` : "Sin cantidad"}</span>
               </div>
             </div>
 
@@ -1171,6 +1218,7 @@ function CycleModal({
 
                 <div style={{ display: "grid", gap: 12, marginTop: 14 }}>
                   {form.llenados.map((fill, index) => {
+                    const fillCctOptions = getSelectOptions(config.ccts, fill.cct);
                     const fillBbtOptions = getSelectOptions(config.bbts, fill.bbt);
                     const lineHelpText =
                       lineasOptions.length === 0
@@ -1245,20 +1293,57 @@ function CycleModal({
                           </div>
                         </div>
 
-                        <div>
-                          <label style={{ fontSize: 12, color: textSoft }}>BBT a llenar</label>
-                          <select
-                            value={fill.bbt}
-                            onChange={(event) => updateFillRow(fill.id, { bbt: event.target.value })}
-                            style={inputStyle}
-                          >
-                            <option value="">Seleccionar...</option>
-                            {fillBbtOptions.map((option) => (
-                              <option key={option} value={option}>
-                                {option}
-                              </option>
-                            ))}
-                          </select>
+                        <div
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                            gap: 10,
+                          }}
+                        >
+                          <div>
+                            <label style={{ fontSize: 12, color: textSoft }}>CCT origen</label>
+                            <select
+                              value={fill.cct}
+                              onChange={(event) => updateFillRow(fill.id, { cct: event.target.value })}
+                              style={inputStyle}
+                            >
+                              <option value="">Seleccionar...</option>
+                              {fillCctOptions.map((option) => (
+                                <option key={option} value={option}>
+                                  {option}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+
+                          <div>
+                            <label style={{ fontSize: 12, color: textSoft }}>BBT a llenar</label>
+                            <select
+                              value={fill.bbt}
+                              onChange={(event) => updateFillRow(fill.id, { bbt: event.target.value })}
+                              style={inputStyle}
+                            >
+                              <option value="">Seleccionar...</option>
+                              {fillBbtOptions.map((option) => (
+                                <option key={option} value={option}>
+                                  {option}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+
+                          <div>
+                            <label style={{ fontSize: 12, color: textSoft }}>Cantidad del BBT (hl)</label>
+                            <input
+                              type="number"
+                              min={0}
+                              step="0.1"
+                              value={fill.cantidadHl}
+                              onChange={(event) => updateFillRow(fill.id, { cantidadHl: event.target.value })}
+                              placeholder="Ej: 120"
+                              style={inputStyle}
+                            />
+                          </div>
                         </div>
 
                         <div
@@ -1365,7 +1450,9 @@ function CycleModal({
                 </div>
 
                 <div style={{ fontSize: 12, color: textSoft, marginTop: 12 }}>
-                  Resumen del ciclo: {form.bbts || "Sin BBTs"} {"|"} {form.lineaEnvasado || "Sin lineas"}
+                  Resumen del ciclo: {form.ccts || "Sin CCTs"} {"|"} {form.bbts || "Sin BBTs"} {"|"}{" "}
+                  {form.cantidadHl ? `${form.cantidadHl} hl` : "Sin cantidad"} {"|"}{" "}
+                  {form.lineaEnvasado || "Sin lineas"}
                 </div>
                 <div style={{ fontSize: 12, color: textSoft, marginTop: 6 }}>
                   Secuencia: {formatCycleFillDetails(form.llenados) || "Sin rangos definidos"}
@@ -1893,7 +1980,10 @@ function AnalysisPanel({
       Array.from(
         new Set(
           cycles
-            .flatMap((cycle) => [cycle.ccts, cycle.origenMezclaTipo === "cct" ? cycle.origenMezcla : ""])
+            .flatMap((cycle) => [
+              ...cycle.llenados.map((fill) => fill.cct),
+              cycle.origenMezclaTipo === "cct" ? cycle.origenMezcla : "",
+            ])
             .filter(Boolean)
         )
       ).sort(),
@@ -1923,7 +2013,9 @@ function AnalysisPanel({
         const matchesLinea =
           !linea || cycle.llenados.some((fill) => fill.lineas.includes(linea));
         const matchesCct =
-          !cct || cycle.ccts === cct || (cycle.origenMezclaTipo === "cct" && cycle.origenMezcla === cct);
+          !cct ||
+          cycle.llenados.some((fill) => fill.cct === cct) ||
+          (cycle.origenMezclaTipo === "cct" && cycle.origenMezcla === cct);
         const matchesBbt =
           !bbt ||
           cycle.llenados.some((fill) => fill.bbt === bbt) ||
@@ -2256,7 +2348,7 @@ function InstructionsPanel() {
         <li>Usa los bordes del bloque para cambiar inicio o fin.</li>
         <li>Si un ciclo choca con otros, la app los reacomoda automaticamente hacia adelante.</li>
         <li>Los ciclos pueden cruzar medianoche y continuar en la siguiente semana.</li>
-        <li>Dentro del modal puedes ordenar varios BBTs, enlazar lineas y definir la hora de inicio y fin de cada llenado.</li>
+        <li>Dentro del modal puedes ordenar varios BBTs, asignar CCT origen, cantidad, lineas y rango horario por llenado.</li>
         <li>Si un llenado BBT termina despues del fin del ciclo, el ciclo se extiende automaticamente.</li>
         <li>Desde Admin puedes manejar productos, colores, CCTs, BBTs y lineas sin tocar codigo.</li>
         <li>Puedes exportar la semana visible a Excel o PDF.</li>
@@ -2265,7 +2357,127 @@ function InstructionsPanel() {
   );
 }
 
+function AuthScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSession) => void }) {
+  const [mode, setMode] = useState<"login" | "register">("login");
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setError("");
+    setLoading(true);
+
+    try {
+      const endpoint = mode === "login" ? "/api/auth/login" : "/api/auth/register";
+      const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          email,
+          password,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(await readApiError(response));
+      }
+
+      const session = (await response.json()) as AuthSession;
+      localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(session));
+      onAuthenticated(session);
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : "No se pudo iniciar sesion.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div
+      style={{
+        minHeight: "100vh",
+        background: appBg,
+        color: text,
+        display: "grid",
+        placeItems: "center",
+        padding: 20,
+        fontFamily: "Arial, sans-serif",
+      }}
+    >
+      <form onSubmit={submit} style={{ ...cardStyle(), width: 420, maxWidth: "100%", padding: 24 }}>
+        <div style={{ fontSize: 24, fontWeight: 700 }}>Plan de filtracion</div>
+        <div style={{ fontSize: 13, color: textSoft, marginTop: 6 }}>
+          {mode === "login" ? "Ingresa para cargar tu plan." : "Crea un usuario para guardar tu plan."}
+        </div>
+
+        {mode === "register" && (
+          <div style={{ marginTop: 16 }}>
+            <label style={{ fontSize: 12, color: textSoft }}>Nombre</label>
+            <input value={name} onChange={(event) => setName(event.target.value)} style={inputStyle} />
+          </div>
+        )}
+
+        <div style={{ marginTop: 16 }}>
+          <label style={{ fontSize: 12, color: textSoft }}>Email</label>
+          <input
+            type="email"
+            value={email}
+            onChange={(event) => setEmail(event.target.value)}
+            style={inputStyle}
+          />
+        </div>
+
+        <div style={{ marginTop: 16 }}>
+          <label style={{ fontSize: 12, color: textSoft }}>Password</label>
+          <input
+            type="password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            style={inputStyle}
+          />
+        </div>
+
+        {error && (
+          <div
+            style={{
+              marginTop: 14,
+              padding: "10px 12px",
+              borderRadius: 10,
+              background: "#fee2e2",
+              color: danger,
+              fontSize: 13,
+              fontWeight: 700,
+            }}
+          >
+            {error}
+          </div>
+        )}
+
+        <button type="submit" disabled={loading} style={{ ...buttonStyle(true), width: "100%", marginTop: 18 }}>
+          {loading ? "Procesando..." : mode === "login" ? "Iniciar sesion" : "Registrarme"}
+        </button>
+
+        <button
+          type="button"
+          onClick={() => {
+            setMode((currentMode) => (currentMode === "login" ? "register" : "login"));
+            setError("");
+          }}
+          style={{ ...buttonStyle(), width: "100%", marginTop: 10 }}
+        >
+          {mode === "login" ? "Crear cuenta" : "Ya tengo cuenta"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
 export default function App() {
+  const [authSession, setAuthSession] = useState<AuthSession | null>(() => readStoredAuth());
   const [cycles, setCycles] = useState<Cycle[]>([]);
   const [config, setConfig] = useState<ConfigState>(DEFAULT_CONFIG);
   const [activeWeekStart, setActiveWeekStart] = useState(getStartOfWeek(new Date()));
@@ -2282,6 +2494,7 @@ export default function App() {
   const [pendingJump, setPendingJump] = useState<JumpTarget | null>(null);
   const [focusedDay, setFocusedDay] = useState<number | null>(null);
   const [storageReady, setStorageReady] = useState(false);
+  const [planError, setPlanError] = useState("");
 
   const nextId = useRef(1);
   const dayScrollRefs = useRef<(HTMLDivElement | null)[]>([]);
@@ -2301,53 +2514,102 @@ export default function App() {
   const weekSegments = useMemo(() => getVisibleWeekSegments(cycles, activeWeekStart), [cycles, activeWeekStart]);
 
   useEffect(() => {
-    const saved =
-      localStorage.getItem(STORAGE_KEY) ??
-      localStorage.getItem(LEGACY_STORAGE_KEY);
-
-    if (!saved) {
-      setStorageReady(true);
+    if (!authSession?.token) {
+      setStorageReady(false);
       return;
     }
 
-    try {
-      const parsed = JSON.parse(saved) as {
-        cycles?: Record<string, unknown>[];
-        config?: Partial<ConfigState>;
-        activeWeekStart?: string;
-      };
+    let cancelled = false;
 
-      const storedCycles = Array.isArray(parsed.cycles)
-        ? sortCycles(parsed.cycles.map((cycle) => hydrateCycle(cycle)))
-        : [];
-      const storedWeekStart =
-        typeof parsed.activeWeekStart === "string" ? getStartOfWeek(parsed.activeWeekStart) : getStartOfWeek(new Date());
+    const loadPlan = async () => {
+      setStorageReady(false);
+      setPlanError("");
 
-      setCycles(storedCycles);
-      setConfig(buildConfigState(parsed.config));
-      setActiveWeekStart(storedWeekStart);
-      setNavigatorDate(storedWeekStart);
-      nextId.current = Math.max(0, ...storedCycles.map((cycle) => cycle.id)) + 1;
-    } catch {
-      setCycles([]);
-      setConfig(DEFAULT_CONFIG);
-    } finally {
-      setStorageReady(true);
-    }
-  }, []);
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/plan`, {
+          headers: {
+            Authorization: `Bearer ${authSession.token}`,
+          },
+        });
+
+        if (!response.ok) {
+          if (response.status === 401) {
+            localStorage.removeItem(AUTH_STORAGE_KEY);
+            setAuthSession(null);
+          }
+
+          throw new Error(await readApiError(response));
+        }
+
+        const parsed = (await response.json()) as {
+          cycles?: Record<string, unknown>[];
+          config?: Partial<ConfigState> | null;
+          activeWeekStart?: string | null;
+        };
+
+        if (cancelled) return;
+
+        const storedCycles = Array.isArray(parsed.cycles)
+          ? sortCycles(parsed.cycles.map((cycle) => hydrateCycle(cycle)))
+          : [];
+        const storedWeekStart =
+          typeof parsed.activeWeekStart === "string"
+            ? getStartOfWeek(parsed.activeWeekStart)
+            : getStartOfWeek(new Date());
+
+        setCycles(storedCycles);
+        setConfig(buildConfigState(parsed.config ?? undefined));
+        setActiveWeekStart(storedWeekStart);
+        setNavigatorDate(storedWeekStart);
+        nextId.current = Math.max(0, ...storedCycles.map((cycle) => cycle.id)) + 1;
+      } catch (caughtError) {
+        if (cancelled) return;
+
+        setCycles([]);
+        setConfig(DEFAULT_CONFIG);
+        setPlanError(caughtError instanceof Error ? caughtError.message : "No se pudo cargar el plan.");
+      } finally {
+        if (!cancelled) setStorageReady(true);
+      }
+    };
+
+    loadPlan();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authSession?.token]);
 
   useEffect(() => {
-    if (!storageReady) return;
+    if (!storageReady || !authSession?.token) return;
 
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({
-        cycles,
-        config,
-        activeWeekStart,
-      })
-    );
-  }, [cycles, config, activeWeekStart, storageReady]);
+    const timeout = window.setTimeout(async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/plan`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${authSession.token}`,
+          },
+          body: JSON.stringify({
+            cycles,
+            config,
+            activeWeekStart,
+          }),
+        });
+
+        if (!response.ok) {
+          throw new Error(await readApiError(response));
+        }
+
+        setPlanError("");
+      } catch (caughtError) {
+        setPlanError(caughtError instanceof Error ? caughtError.message : "No se pudo guardar el plan.");
+      }
+    }, 700);
+
+    return () => window.clearTimeout(timeout);
+  }, [cycles, config, activeWeekStart, storageReady, authSession?.token]);
 
   useEffect(() => {
     if (!notice) return;
@@ -2591,7 +2853,7 @@ export default function App() {
       Producto: getCycleDisplayName(cycle),
       CCTs: cycle.ccts,
       BBTs: cycle.bbts,
-      "Detalle BBT / linea / horario": formatCycleFillDetails(cycle.llenados),
+      "Detalle CCT / BBT / cantidad / horario": formatCycleFillDetails(cycle.llenados),
       "Cantidad (hl)": cycle.cantidadHl,
       "Lineas de envasado": cycle.lineaEnvasado,
       "Mant. programado": cycle.mantenimientoProgramado ? "Si" : "No",
@@ -2688,6 +2950,51 @@ export default function App() {
     setSelectedDayIndex(nextDayIndex);
     setNavigatorDate(addDays(activeWeekStart, nextDayIndex));
   };
+
+  const handleAuthenticated = (session: AuthSession) => {
+    setAuthSession(session);
+    setPlanError("");
+  };
+
+  const logout = () => {
+    localStorage.removeItem(AUTH_STORAGE_KEY);
+    setAuthSession(null);
+    setCycles([]);
+    setConfig(DEFAULT_CONFIG);
+    setActiveWeekStart(getStartOfWeek(new Date()));
+    setNavigatorDate(toDateInputValue(new Date()));
+    setStorageReady(false);
+    setPlanError("");
+    nextId.current = 1;
+  };
+
+  if (!authSession) {
+    return <AuthScreen onAuthenticated={handleAuthenticated} />;
+  }
+
+  if (!storageReady) {
+    return (
+      <div
+        style={{
+          minHeight: "100vh",
+          background: appBg,
+          color: text,
+          padding: 20,
+          fontFamily: "Arial, sans-serif",
+          display: "grid",
+          placeItems: "center",
+        }}
+      >
+        <div style={{ ...cardStyle(), padding: 24, width: 420, maxWidth: "100%", textAlign: "center" }}>
+          <div style={{ fontSize: 22, fontWeight: 700 }}>Cargando plan</div>
+          <div style={{ fontSize: 13, color: textSoft, marginTop: 8 }}>{authSession.user.email}</div>
+          <button type="button" onClick={logout} style={{ ...buttonStyle(), marginTop: 18 }}>
+            Cerrar sesion
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   const selectedDayDate = addDays(activeWeekStart, selectedDayIndex);
   const selectedDayStartSlot = slotFromDateHour(selectedDayDate, 0);
@@ -2980,7 +3287,10 @@ export default function App() {
             PLAN DE PRODUCCION DE FILTRACION CERVECERIA DEL ATLANTICO
           </div>
           <div style={{ fontSize: 13, color: textSoft }}>
-            Plan semanal dinamico con ciclos continuos y guardado local
+            Plan semanal dinamico con ciclos continuos y guardado por usuario
+          </div>
+          <div style={{ fontSize: 12, color: textSoft, marginTop: 4 }}>
+            Sesion: {authSession.user.name} | {authSession.user.email}
           </div>
         </div>
 
@@ -2997,8 +3307,26 @@ export default function App() {
           <button onClick={() => setTab("instructions")} style={buttonStyle(tab === "instructions")}>
             Instrucciones
           </button>
+          <button onClick={logout} style={buttonStyle()}>
+            Cerrar sesion
+          </button>
         </div>
       </div>
+
+      {planError && (
+        <div
+          style={{
+            ...cardStyle(),
+            padding: "12px 16px",
+            marginBottom: 16,
+            background: "#fff7ed",
+            color: "#9a3412",
+            fontWeight: 700,
+          }}
+        >
+          {planError}
+        </div>
+      )}
 
       {tab === "plan" && (
         <>

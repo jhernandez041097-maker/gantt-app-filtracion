@@ -1,6 +1,8 @@
 export type CycleFillTarget = {
   id: string;
+  cct: string;
   bbt: string;
+  cantidadHl: string;
   lineas: string[];
   startDate: string;
   startHour: number;
