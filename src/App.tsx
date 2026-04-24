@@ -15,15 +15,18 @@ import {
   getCycleBounds,
   getCycleDurationHours,
   getDayIndexFromDate,
+  getFillBounds,
+  getFillDurationHours,
   getStartOfWeek,
   getVisibleWeekCycles,
   getVisibleWeekSegments,
   rangeFromSlots,
+  shiftCycle,
   slotFromDateHour,
   sortCycles,
   toDateInputValue,
 } from "./schedule";
-import type { Cycle, CycleDraft } from "./schedule";
+import type { Cycle, CycleDraft, CycleFillTarget } from "./schedule";
 
 type ModalState =
   | null
@@ -135,6 +138,149 @@ function readStringArrayOrNull(value: unknown) {
   return normalizeStringList(value.filter((item): item is string => typeof item === "string"));
 }
 
+function createCycleFillTarget(
+  overrides?: Partial<CycleFillTarget>,
+  fallbackRange?: Partial<Pick<CycleFillTarget, "startDate" | "startHour" | "endDate" | "endHour">>
+): CycleFillTarget {
+  const id = typeof overrides?.id === "string" ? overrides.id.trim() : "";
+  const fallbackStartDate = fallbackRange?.startDate ?? toDateInputValue(new Date());
+  const fallbackStartHour = sanitizeStartHour(fallbackRange?.startHour, 6);
+  const fallbackEndRange = rangeFromSlots(
+    slotFromDateHour(fallbackStartDate, fallbackStartHour),
+    slotFromDateHour(fallbackStartDate, fallbackStartHour) + 1
+  );
+  const fallbackEndDate = fallbackRange?.endDate ?? fallbackEndRange.endDate;
+  const fallbackEndHour = sanitizeEndHour(fallbackRange?.endHour, fallbackEndRange.endHour);
+
+  const startDate = typeof overrides?.startDate === "string" ? overrides.startDate : fallbackStartDate;
+  const startHour = sanitizeStartHour(overrides?.startHour, fallbackStartHour);
+  const endDate = typeof overrides?.endDate === "string" ? overrides.endDate : fallbackEndDate;
+  const endHour = sanitizeEndHour(overrides?.endHour, fallbackEndHour);
+  const startSlot = slotFromDateHour(startDate, startHour);
+  const endSlot = slotFromDateHour(endDate, endHour);
+  const normalizedRange = endSlot > startSlot
+    ? { startDate, startHour, endDate, endHour }
+    : rangeFromSlots(startSlot, startSlot + 1);
+
+  return {
+    id: id || `fill-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    bbt: typeof overrides?.bbt === "string" ? overrides.bbt.trim() : "",
+    lineas: normalizeStringList(overrides?.lineas ?? []),
+    ...normalizedRange,
+  };
+}
+
+function sanitizeCycleFillTargets(
+  value: unknown,
+  fallbackRange?: Pick<CycleDraft, "startDate" | "startHour" | "endDate" | "endHour">
+) {
+  if (!Array.isArray(value)) return [];
+
+  let fallbackStartSlot = fallbackRange ? slotFromDateHour(fallbackRange.startDate, fallbackRange.startHour) : null;
+
+  return value
+    .filter((item): item is Partial<CycleFillTarget> => typeof item === "object" && item !== null)
+    .map((item) => {
+      const fallback = fallbackStartSlot === null ? undefined : rangeFromSlots(fallbackStartSlot, fallbackStartSlot + 1);
+      const fill = createCycleFillTarget(item, fallback);
+
+      fallbackStartSlot = getFillBounds(fill).endSlot;
+      return fill;
+    });
+}
+
+function getMeaningfulCycleFillTargets(fills: CycleFillTarget[]) {
+  return fills.filter((fill) => fill.bbt || fill.lineas.length > 0);
+}
+
+function getCycleFillSummary(fills: CycleFillTarget[]) {
+  const meaningfulFills = getMeaningfulCycleFillTargets(fills);
+
+  return {
+    bbts: normalizeStringList(meaningfulFills.map((fill) => fill.bbt)).join(", "),
+    lineaEnvasado: normalizeStringList(meaningfulFills.flatMap((fill) => fill.lineas)).join(", "),
+  };
+}
+
+function formatCycleFillDetails(fills: CycleFillTarget[]) {
+  return getMeaningfulCycleFillTargets(fills)
+    .map((fill, index) => {
+      const fillRange = `${formatDateTimeLabel(fill.startDate, fill.startHour)} -> ${formatDateTimeLabel(
+        fill.endDate,
+        fill.endHour
+      )}`;
+      const duration = getFillDurationHours(fill);
+
+      return `${index + 1}. ${fill.bbt || "Sin BBT"} -> ${
+        fill.lineas.length > 0 ? fill.lineas.join(", ") : "Sin lineas"
+      } | ${fillRange} (${duration}h)`;
+    })
+    .join(" | ");
+}
+
+function syncCycleFillFields(cycle: CycleDraft, options?: { preserveEmptyRows?: boolean }): CycleDraft {
+  const sanitizedFills = sanitizeCycleFillTargets(cycle.llenados, cycle);
+  const meaningfulFills = getMeaningfulCycleFillTargets(sanitizedFills);
+  const fills =
+    options?.preserveEmptyRows
+      ? sanitizedFills
+      : meaningfulFills;
+  const summary = getCycleFillSummary(sanitizedFills);
+  const nextRange = getCycleRangeIncludingFills(cycle, meaningfulFills);
+
+  return {
+    ...cycle,
+    ...nextRange,
+    llenados: fills,
+    bbts: summary.bbts,
+    lineaEnvasado: summary.lineaEnvasado,
+  };
+}
+
+function getCycleRangeIncludingFills(
+  cycle: Pick<CycleDraft, "startDate" | "startHour" | "endDate" | "endHour">,
+  fills: CycleFillTarget[]
+) {
+  let { startSlot, endSlot } = getCycleBounds(cycle);
+
+  fills.forEach((fill) => {
+    const fillBounds = getFillBounds(fill);
+    startSlot = Math.min(startSlot, fillBounds.startSlot);
+    endSlot = Math.max(endSlot, fillBounds.endSlot);
+  });
+
+  return rangeFromSlots(startSlot, endSlot);
+}
+
+function ensureCycleCoversFills<T extends Pick<CycleDraft, "startDate" | "startHour" | "endDate" | "endHour" | "llenados">>(
+  cycle: T
+): T {
+  return {
+    ...cycle,
+    ...getCycleRangeIncludingFills(cycle, getMeaningfulCycleFillTargets(cycle.llenados)),
+  };
+}
+
+function getHydratedCycleFillTargets(
+  raw: Record<string, unknown>,
+  fallbackRange: Pick<CycleDraft, "startDate" | "startHour" | "endDate" | "endHour">
+) {
+  const storedFills = sanitizeCycleFillTargets(raw.llenados, fallbackRange);
+  if (storedFills.length > 0) return storedFills;
+
+  const legacyBbt = typeof raw.bbts === "string" ? raw.bbts.trim() : "";
+  const legacyLinea = typeof raw.lineaEnvasado === "string" ? raw.lineaEnvasado.trim() : "";
+
+  if (!legacyBbt && !legacyLinea) return [];
+
+  return [
+    createCycleFillTarget({
+      bbt: legacyBbt,
+      lineas: legacyLinea ? [legacyLinea] : [],
+    }, fallbackRange),
+  ];
+}
+
 function getSelectOptions(options: string[], currentValue: string) {
   return normalizeStringList(currentValue ? [currentValue, ...options] : options);
 }
@@ -182,17 +328,21 @@ function hydrateCycle(raw: Record<string, unknown>): Cycle {
   const endSlotCandidate = slotFromDateHour(rawEndDate, rawEndHour);
   const endSlot = endSlotCandidate > startSlot ? endSlotCandidate : startSlot + 1;
   const normalizedRange = rangeFromSlots(startSlot, endSlot);
+  const llenados = getHydratedCycleFillTargets(raw, normalizedRange);
+  const fillSummary = getCycleFillSummary(llenados);
+  const finalRange = getCycleRangeIncludingFills(normalizedRange, getMeaningfulCycleFillTargets(llenados));
 
   return {
     id: typeof raw.id === "number" ? raw.id : 0,
-    ...normalizedRange,
+    ...finalRange,
     producto: typeof raw.producto === "string" ? raw.producto : "",
     color: typeof raw.color === "string" ? raw.color : "#3b82f6",
     aseo: Boolean(raw.aseo),
     ccts: typeof raw.ccts === "string" ? raw.ccts : "",
-    bbts: typeof raw.bbts === "string" ? raw.bbts : "",
+    llenados,
+    bbts: fillSummary.bbts,
     cantidadHl: typeof raw.cantidadHl === "string" ? raw.cantidadHl : "",
-    lineaEnvasado: typeof raw.lineaEnvasado === "string" ? raw.lineaEnvasado : "",
+    lineaEnvasado: fillSummary.lineaEnvasado,
     mezcla: Boolean(raw.mezcla),
     origenMezclaTipo:
       raw.origenMezclaTipo === "bbt" || raw.origenMezclaTipo === "cct" ? raw.origenMezclaTipo : "",
@@ -262,6 +412,7 @@ function createEmptyCycle(
     color: config.colores[0] || "#3b82f6",
     aseo: false,
     ccts: "",
+    llenados: [createCycleFillTarget(undefined, fallbackRange)],
     bbts: "",
     cantidadHl: "",
     lineaEnvasado: "",
@@ -294,6 +445,43 @@ function validateCycle(cycle: CycleDraft) {
     return "Describe en notas lo que se realizara en el mantenimiento.";
   }
 
+  const meaningfulFills = getMeaningfulCycleFillTargets(cycle.llenados);
+
+  if (!isSpecialEventCycle(cycle)) {
+    if (meaningfulFills.length === 0) {
+      return "Agrega al menos un BBT a llenar.";
+    }
+
+    if (meaningfulFills.some((fill) => !fill.bbt)) {
+      return "Cada llenado debe tener un BBT seleccionado.";
+    }
+
+    if (meaningfulFills.some((fill) => fill.lineas.length === 0)) {
+      return "Cada BBT debe estar enlazado al menos a una linea.";
+    }
+
+    let previousFillEndSlot: number | null = null;
+    const cycleBounds = getCycleBounds(cycle);
+
+    for (const [index, fill] of meaningfulFills.entries()) {
+      const fillBounds = getFillBounds(fill);
+
+      if (fillBounds.endSlot <= fillBounds.startSlot) {
+        return `El llenado ${index + 1} debe tener una hora final mayor al inicio.`;
+      }
+
+      if (fillBounds.startSlot < cycleBounds.startSlot || fillBounds.endSlot > cycleBounds.endSlot) {
+        return `El llenado ${index + 1} debe quedar dentro del rango del ciclo.`;
+      }
+
+      if (previousFillEndSlot !== null && fillBounds.startSlot < previousFillEndSlot) {
+        return `El llenado ${index + 1} debe iniciar despues de que termine el llenado anterior.`;
+      }
+
+      previousFillEndSlot = fillBounds.endSlot;
+    }
+  }
+
   if (!isSpecialEventCycle(cycle) && cycle.mezcla) {
     if (!cycle.origenMezclaTipo) return "Selecciona si la mezcla viene de BBT o CCT.";
     if (!cycle.origenMezcla.trim()) return "Selecciona el origen de la mezcla.";
@@ -324,7 +512,8 @@ function formatCycleTooltip(cycle: Cycle) {
     if (cycle.ccts) lines.push(`CCTs: ${cycle.ccts}`);
     if (cycle.bbts) lines.push(`BBTs: ${cycle.bbts}`);
     if (cycle.cantidadHl) lines.push(`Cantidad: ${cycle.cantidadHl} hl`);
-    if (cycle.lineaEnvasado) lines.push(`Linea de envasado: ${cycle.lineaEnvasado}`);
+    if (cycle.lineaEnvasado) lines.push(`Lineas de envasado: ${cycle.lineaEnvasado}`);
+    if (formatCycleFillDetails(cycle.llenados)) lines.push(`Detalle llenado: ${formatCycleFillDetails(cycle.llenados)}`);
     if (cycle.mezcla) lines.push("Mezcla: Si");
     if (formatOrigenMezcla(cycle)) lines.push(`Origen mezcla: ${formatOrigenMezcla(cycle)}`);
     if (cycle.proporcionMezcla) lines.push(`Proporcion: ${cycle.proporcionMezcla}`);
@@ -356,9 +545,11 @@ function buildUsageMaps(cycles: Cycle[]): UsageMaps {
     }
 
     incrementUsage(usageMaps.colores, cycle.color);
-    incrementUsage(usageMaps.ccts, cycle.ccts);
-    incrementUsage(usageMaps.bbts, cycle.bbts);
-    incrementUsage(usageMaps.lineasEnvasado, cycle.lineaEnvasado);
+    normalizeStringList([cycle.ccts]).forEach((item) => incrementUsage(usageMaps.ccts, item));
+    normalizeStringList(cycle.llenados.map((fill) => fill.bbt)).forEach((item) => incrementUsage(usageMaps.bbts, item));
+    normalizeStringList(cycle.llenados.flatMap((fill) => fill.lineas)).forEach((item) =>
+      incrementUsage(usageMaps.lineasEnvasado, item)
+    );
 
     if (cycle.mezcla && cycle.origenMezclaTipo === "cct") {
       incrementUsage(usageMaps.ccts, cycle.origenMezcla);
@@ -385,7 +576,39 @@ function getCycleIssues(cycle: Cycle) {
   } else {
     if (!cycle.producto.trim()) issues.push("Sin producto.");
     if (!cycle.ccts.trim()) issues.push("Sin CCT asignado.");
-    if (!cycle.bbts.trim()) issues.push("Sin BBT asignado.");
+    if (getMeaningfulCycleFillTargets(cycle.llenados).length === 0) issues.push("Sin BBT asignado.");
+    if (cycle.llenados.some((fill) => fill.bbt.trim() && fill.lineas.length === 0)) {
+      issues.push("Hay BBTs sin lineas asociadas.");
+    }
+    if (cycle.llenados.some((fill) => !fill.bbt.trim() && fill.lineas.length > 0)) {
+      issues.push("Hay lineas sin BBT asociado.");
+    }
+    if (
+      getMeaningfulCycleFillTargets(cycle.llenados).some((fill) => {
+        const fillBounds = getFillBounds(fill);
+        return fillBounds.endSlot <= fillBounds.startSlot;
+      })
+    ) {
+      issues.push("Hay llenados con rango horario invalido.");
+    }
+    if (
+      getMeaningfulCycleFillTargets(cycle.llenados).some((fill) => {
+        const cycleBounds = getCycleBounds(cycle);
+        const fillBounds = getFillBounds(fill);
+        return fillBounds.startSlot < cycleBounds.startSlot || fillBounds.endSlot > cycleBounds.endSlot;
+      })
+    ) {
+      issues.push("Hay llenados fuera del rango del ciclo.");
+    }
+    const orderedFills = getMeaningfulCycleFillTargets(cycle.llenados);
+    if (
+      orderedFills.some((fill, index) => {
+        if (index === 0) return false;
+        return getFillBounds(fill).startSlot < getFillBounds(orderedFills[index - 1]).endSlot;
+      })
+    ) {
+      issues.push("Hay llenados fuera de orden horario.");
+    }
     if (!cycle.cantidadHl.trim()) issues.push("Sin cantidad (hl).");
     if (!cycle.lineaEnvasado.trim()) issues.push("Sin linea de envasado.");
   }
@@ -509,26 +732,35 @@ function CycleModal({
     if (!openState) return;
 
     if (existing) {
-      setForm({
-        startDate: existing.startDate,
-        startHour: existing.startHour,
-        endDate: existing.endDate,
-        endHour: existing.endHour,
-        producto: existing.producto,
-        color: existing.color,
-        aseo: existing.aseo,
-        ccts: existing.ccts,
-        bbts: existing.bbts,
-        cantidadHl: existing.cantidadHl,
-        lineaEnvasado: existing.lineaEnvasado,
-        mezcla: existing.mezcla,
-        origenMezclaTipo: existing.origenMezclaTipo,
-        origenMezcla: existing.origenMezcla,
-        proporcionMezcla: existing.proporcionMezcla,
-        mantenimientoProgramado: existing.mantenimientoProgramado,
-        mantenimientoCorrectivo: existing.mantenimientoCorrectivo,
-        notas: existing.notas,
-      });
+      setForm(
+        syncCycleFillFields(
+          {
+            startDate: existing.startDate,
+            startHour: existing.startHour,
+            endDate: existing.endDate,
+            endHour: existing.endHour,
+            producto: existing.producto,
+            color: existing.color,
+            aseo: existing.aseo,
+            ccts: existing.ccts,
+            llenados:
+              existing.llenados.length > 0
+                ? existing.llenados.map((fill) => createCycleFillTarget(fill))
+                : [createCycleFillTarget(undefined, existing)],
+            bbts: existing.bbts,
+            cantidadHl: existing.cantidadHl,
+            lineaEnvasado: existing.lineaEnvasado,
+            mezcla: existing.mezcla,
+            origenMezclaTipo: existing.origenMezclaTipo,
+            origenMezcla: existing.origenMezcla,
+            proporcionMezcla: existing.proporcionMezcla,
+            mantenimientoProgramado: existing.mantenimientoProgramado,
+            mantenimientoCorrectivo: existing.mantenimientoCorrectivo,
+            notas: existing.notas,
+          },
+          { preserveEmptyRows: true }
+        )
+      );
     } else {
       setForm(
         createEmptyCycle(config, {
@@ -547,6 +779,75 @@ function CycleModal({
     setForm((previous) => ({ ...previous, [key]: value }));
   };
 
+  const setFillRows = (fills: CycleFillTarget[]) => {
+    setForm((previous) => syncCycleFillFields({ ...previous, llenados: fills }, { preserveEmptyRows: true }));
+  };
+
+  const updateFillRow = (fillId: string, patch: Partial<CycleFillTarget>) => {
+    setFillRows(
+      form.llenados.map((fill) =>
+        fill.id === fillId
+          ? createCycleFillTarget({
+              ...fill,
+              ...patch,
+              lineas: patch.lineas ?? fill.lineas,
+            })
+          : fill
+      )
+    );
+  };
+
+  const updateFillRange = (
+    fillId: string,
+    patch: Partial<Pick<CycleFillTarget, "startDate" | "startHour" | "endDate" | "endHour">>
+  ) => {
+    updateFillRow(fillId, patch);
+  };
+
+  const addFillRow = () => {
+    const cycleStartSlot = slotFromDateHour(form.startDate, form.startHour);
+    const nextStartSlot = form.llenados.reduce(
+      (latestSlot, fill) => Math.max(latestSlot, getFillBounds(fill).endSlot),
+      cycleStartSlot
+    );
+
+    setFillRows([...form.llenados, createCycleFillTarget(undefined, rangeFromSlots(nextStartSlot, nextStartSlot + 1))]);
+  };
+
+  const removeFillRow = (fillId: string) => {
+    const remaining = form.llenados.filter((fill) => fill.id !== fillId);
+    setFillRows(remaining.length > 0 ? remaining : [createCycleFillTarget(undefined, form)]);
+  };
+
+  const moveFillRow = (fillId: string, direction: -1 | 1) => {
+    const currentIndex = form.llenados.findIndex((fill) => fill.id === fillId);
+    const targetIndex = currentIndex + direction;
+
+    if (currentIndex < 0 || targetIndex < 0 || targetIndex >= form.llenados.length) return;
+
+    const orderedRanges = form.llenados.map((fill) => ({
+      startDate: fill.startDate,
+      startHour: fill.startHour,
+      endDate: fill.endDate,
+      endHour: fill.endHour,
+    }));
+    const nextFills = [...form.llenados];
+    const [movedFill] = nextFills.splice(currentIndex, 1);
+    nextFills.splice(targetIndex, 0, movedFill);
+    setFillRows(nextFills.map((fill, index) => createCycleFillTarget({ ...fill, ...orderedRanges[index] })));
+  };
+
+  const toggleFillLine = (fillId: string, line: string) => {
+    const target = form.llenados.find((fill) => fill.id === fillId);
+    if (!target) return;
+
+    const nextLines = target.lineas.includes(line)
+      ? target.lineas.filter((item) => item !== line)
+      : [...target.lineas, line];
+
+    updateFillRow(fillId, { lineas: nextLines });
+  };
+
   const updateRange = (patch: Partial<Pick<CycleDraft, "startDate" | "startHour" | "endDate" | "endHour">>) => {
     setForm((previous) => {
       const next = { ...previous, ...patch };
@@ -558,13 +859,12 @@ function CycleModal({
         next.endHour = adjusted.endHour;
       }
 
-      return next;
+      return syncCycleFillFields(next, { preserveEmptyRows: true });
     });
   };
 
   const cctsOptions = getSelectOptions(config.ccts, form.ccts);
-  const bbtsOptions = getSelectOptions(config.bbts, form.bbts);
-  const lineasOptions = getSelectOptions(config.lineasEnvasado, form.lineaEnvasado);
+  const lineasOptions = normalizeStringList([...config.lineasEnvasado, ...form.llenados.flatMap((fill) => fill.lineas)]);
   const origenOptions = getSelectOptions(
     form.origenMezclaTipo === "bbt" ? config.bbts : config.ccts,
     form.origenMezcla
@@ -584,6 +884,7 @@ function CycleModal({
       producto: checked ? "ASEO" : defaultProduct,
       color: checked ? "#94a3b8" : defaultColor,
       ccts: checked ? "" : previous.ccts,
+      llenados: checked ? [] : previous.llenados,
       bbts: checked ? "" : previous.bbts,
       cantidadHl: checked ? "" : previous.cantidadHl,
       lineaEnvasado: checked ? "" : previous.lineaEnvasado,
@@ -612,6 +913,7 @@ function CycleModal({
             : "#f59e0b"
           : defaultColor,
         ccts: nextMaintenanceActive ? "" : previous.ccts,
+        llenados: nextMaintenanceActive ? [] : previous.llenados,
         bbts: nextMaintenanceActive ? "" : previous.bbts,
         cantidadHl: nextMaintenanceActive ? "" : previous.cantidadHl,
         lineaEnvasado: nextMaintenanceActive ? "" : previous.lineaEnvasado,
@@ -624,13 +926,14 @@ function CycleModal({
   };
 
   const save = () => {
-    const error = validateCycle(form);
+    const nextForm = syncCycleFillFields(form);
+    const error = validateCycle(nextForm);
     if (error) {
       alert(error);
       return;
     }
 
-    onSave(form, existing?.id);
+    onSave(nextForm, existing?.id);
   };
 
   return (
@@ -824,22 +1127,6 @@ function CycleModal({
               </div>
 
               <div>
-                <label style={{ fontSize: 12, color: textSoft }}>BBTs</label>
-                <select
-                  value={form.bbts}
-                  onChange={(event) => setField("bbts", event.target.value)}
-                  style={inputStyle}
-                >
-                  <option value="">Seleccionar...</option>
-                  {bbtsOptions.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
                 <label style={{ fontSize: 12, color: textSoft }}>Cantidad (hl)</label>
                 <input
                   type="number"
@@ -851,21 +1138,238 @@ function CycleModal({
                   style={inputStyle}
                 />
               </div>
+            </div>
 
+            <div
+              style={{
+                ...cardStyle(),
+                padding: 16,
+                marginBottom: 16,
+                background: "#f8fbff",
+              }}
+            >
               <div>
-                <label style={{ fontSize: 12, color: textSoft }}>Linea de envasado</label>
-                <select
-                  value={form.lineaEnvasado}
-                  onChange={(event) => setField("lineaEnvasado", event.target.value)}
-                  style={inputStyle}
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    gap: 12,
+                    flexWrap: "wrap",
+                    alignItems: "center",
+                  }}
                 >
-                  <option value="">Seleccionar...</option>
-                  {lineasOptions.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
+                  <div>
+                    <div style={{ fontSize: 12, color: textSoft }}>Llenados del ciclo</div>
+                    <div style={{ fontSize: 13, marginTop: 4 }}>
+                      Ordena los BBTs y asigna el rango de llenado de cada uno. Si un rango pasa el fin del ciclo, el ciclo se extiende.
+                    </div>
+                  </div>
+                  <button type="button" onClick={addFillRow} style={buttonStyle()}>
+                    Agregar BBT
+                  </button>
+                </div>
+
+                <div style={{ display: "grid", gap: 12, marginTop: 14 }}>
+                  {form.llenados.map((fill, index) => {
+                    const fillBbtOptions = getSelectOptions(config.bbts, fill.bbt);
+                    const lineHelpText =
+                      lineasOptions.length === 0
+                        ? "No hay lineas configuradas en Admin."
+                        : "Selecciona una o varias lineas para este BBT.";
+
+                    return (
+                      <div
+                        key={fill.id}
+                        style={{
+                          border: `1px solid ${border}`,
+                          borderRadius: 14,
+                          padding: 14,
+                          background: "#fff",
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            gap: 12,
+                            flexWrap: "wrap",
+                            alignItems: "center",
+                            marginBottom: 10,
+                          }}
+                        >
+                          <div>
+                            <div style={{ fontWeight: 700 }}>Orden {index + 1}</div>
+                            <div style={{ fontSize: 12, color: textSoft, marginTop: 2 }}>
+                              {getFillDurationHours(fill)}h de llenado
+                            </div>
+                          </div>
+                          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                            <button
+                              type="button"
+                              onClick={() => moveFillRow(fill.id, -1)}
+                              disabled={index === 0}
+                              style={{
+                                ...buttonStyle(),
+                                padding: "6px 10px",
+                                opacity: index === 0 ? 0.45 : 1,
+                                cursor: index === 0 ? "not-allowed" : "pointer",
+                              }}
+                            >
+                              Subir
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => moveFillRow(fill.id, 1)}
+                              disabled={index === form.llenados.length - 1}
+                              style={{
+                                ...buttonStyle(),
+                                padding: "6px 10px",
+                                opacity: index === form.llenados.length - 1 ? 0.45 : 1,
+                                cursor: index === form.llenados.length - 1 ? "not-allowed" : "pointer",
+                              }}
+                            >
+                              Bajar
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => removeFillRow(fill.id)}
+                              style={{
+                                ...buttonStyle(),
+                                color: danger,
+                                border: `1px solid ${danger}`,
+                                padding: "6px 10px",
+                              }}
+                            >
+                              Quitar
+                            </button>
+                          </div>
+                        </div>
+
+                        <div>
+                          <label style={{ fontSize: 12, color: textSoft }}>BBT a llenar</label>
+                          <select
+                            value={fill.bbt}
+                            onChange={(event) => updateFillRow(fill.id, { bbt: event.target.value })}
+                            style={inputStyle}
+                          >
+                            <option value="">Seleccionar...</option>
+                            {fillBbtOptions.map((option) => (
+                              <option key={option} value={option}>
+                                {option}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <div
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+                            gap: 10,
+                            marginTop: 12,
+                          }}
+                        >
+                          <div>
+                            <label style={{ fontSize: 12, color: textSoft }}>Fecha inicio llenado</label>
+                            <input
+                              type="date"
+                              value={fill.startDate}
+                              onChange={(event) => updateFillRange(fill.id, { startDate: event.target.value })}
+                              style={inputStyle}
+                            />
+                          </div>
+                          <div>
+                            <label style={{ fontSize: 12, color: textSoft }}>Hora inicio llenado</label>
+                            <select
+                              value={fill.startHour}
+                              onChange={(event) => updateFillRange(fill.id, { startHour: Number(event.target.value) })}
+                              style={inputStyle}
+                            >
+                              {HOURS.map((hour) => (
+                                <option key={hour} value={hour}>
+                                  {formatHour(hour)}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                          <div>
+                            <label style={{ fontSize: 12, color: textSoft }}>Fecha fin llenado</label>
+                            <input
+                              type="date"
+                              value={fill.endDate}
+                              onChange={(event) => updateFillRange(fill.id, { endDate: event.target.value })}
+                              style={inputStyle}
+                            />
+                          </div>
+                          <div>
+                            <label style={{ fontSize: 12, color: textSoft }}>Hora fin llenado</label>
+                            <select
+                              value={fill.endHour}
+                              onChange={(event) => updateFillRange(fill.id, { endHour: Number(event.target.value) })}
+                              style={inputStyle}
+                            >
+                              {END_HOUR_OPTIONS.map((hour) => (
+                                <option key={hour} value={hour}>
+                                  {formatHourOption(hour)}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        </div>
+
+                        <div style={{ marginTop: 12 }}>
+                          <div style={{ fontSize: 12, color: textSoft }}>Lineas asociadas</div>
+                          <div style={{ fontSize: 12, color: textSoft, marginTop: 4 }}>{lineHelpText}</div>
+
+                          {lineasOptions.length > 0 && (
+                            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+                              {lineasOptions.map((linea) => {
+                                const checked = fill.lineas.includes(linea);
+
+                                return (
+                                  <label
+                                    key={`${fill.id}-${linea}`}
+                                    style={{
+                                      display: "inline-flex",
+                                      alignItems: "center",
+                                      gap: 8,
+                                      padding: "8px 10px",
+                                      borderRadius: 999,
+                                      border: `1px solid ${checked ? primary : border}`,
+                                      background: checked ? primarySoft : "#fff",
+                                      cursor: "pointer",
+                                      fontSize: 13,
+                                    }}
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      checked={checked}
+                                      onChange={() => toggleFillLine(fill.id, linea)}
+                                    />
+                                    {linea}
+                                  </label>
+                                );
+                              })}
+                            </div>
+                          )}
+
+                          {fill.lineas.length > 0 && (
+                            <div style={{ fontSize: 12, color: textSoft, marginTop: 10 }}>
+                              Lineas seleccionadas: {fill.lineas.join(", ")}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div style={{ fontSize: 12, color: textSoft, marginTop: 12 }}>
+                  Resumen del ciclo: {form.bbts || "Sin BBTs"} {"|"} {form.lineaEnvasado || "Sin lineas"}
+                </div>
+                <div style={{ fontSize: 12, color: textSoft, marginTop: 6 }}>
+                  Secuencia: {formatCycleFillDetails(form.llenados) || "Sin rangos definidos"}
+                </div>
               </div>
             </div>
 
@@ -960,8 +1464,8 @@ function CycleModal({
           >
             <div style={{ fontSize: 12, color: textSoft, marginBottom: 10 }}>
               {form.aseo
-                ? "Para ASEO se anulan automaticamente CCTs, BBTs, cantidad, linea de envasado y mezcla."
-                : "Para mantenimiento se anulan automaticamente CCTs, BBTs, cantidad, linea de envasado y mezcla."}
+                ? "Para ASEO se anulan automaticamente CCTs, llenados BBT / linea, cantidad y mezcla."
+                : "Para mantenimiento se anulan automaticamente CCTs, llenados BBT / linea, cantidad y mezcla."}
             </div>
           </div>
         )}
@@ -1373,7 +1877,14 @@ function AnalysisPanel({
   );
 
   const lineOptions = useMemo(
-    () => Array.from(new Set(cycles.map((cycle) => cycle.lineaEnvasado).filter(Boolean))).sort(),
+    () =>
+      Array.from(
+        new Set(
+          cycles
+            .flatMap((cycle) => cycle.llenados.flatMap((fill) => fill.lineas))
+            .filter(Boolean)
+        )
+      ).sort(),
     [cycles]
   );
 
@@ -1394,7 +1905,10 @@ function AnalysisPanel({
       Array.from(
         new Set(
           cycles
-            .flatMap((cycle) => [cycle.bbts, cycle.origenMezclaTipo === "bbt" ? cycle.origenMezcla : ""])
+            .flatMap((cycle) => [
+              ...cycle.llenados.map((fill) => fill.bbt),
+              cycle.origenMezclaTipo === "bbt" ? cycle.origenMezcla : "",
+            ])
             .filter(Boolean)
         )
       ).sort(),
@@ -1406,11 +1920,14 @@ function AnalysisPanel({
       sourceCycles.filter((cycle) => {
         const cycleIssues = getCycleIssues(cycle);
         const matchesProducto = !producto || cycle.producto === producto;
-        const matchesLinea = !linea || cycle.lineaEnvasado === linea;
+        const matchesLinea =
+          !linea || cycle.llenados.some((fill) => fill.lineas.includes(linea));
         const matchesCct =
           !cct || cycle.ccts === cct || (cycle.origenMezclaTipo === "cct" && cycle.origenMezcla === cct);
         const matchesBbt =
-          !bbt || cycle.bbts === bbt || (cycle.origenMezclaTipo === "bbt" && cycle.origenMezcla === bbt);
+          !bbt ||
+          cycle.llenados.some((fill) => fill.bbt === bbt) ||
+          (cycle.origenMezclaTipo === "bbt" && cycle.origenMezcla === bbt);
         const matchesMezcla = !onlyMezcla || cycle.mezcla;
         const matchesAseo = !onlyAseo || cycle.aseo;
         const matchesIssues = !onlyIssues || cycleIssues.length > 0;
@@ -1662,10 +2179,10 @@ function AnalysisPanel({
       <div style={{ ...cardStyle(), padding: 18 }}>
         <h3 style={{ marginTop: 0 }}>Resultados filtrados</h3>
         <div style={{ overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 980 }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 1040 }}>
             <thead>
               <tr style={{ textAlign: "left", borderBottom: `1px solid ${border}` }}>
-                {["Inicio", "Fin", "Duracion", "Producto", "CCT", "BBT", "HL", "Linea", "Mantenimiento", "Mezcla"].map(
+                {["Inicio", "Fin", "Duracion", "Producto", "CCT", "Llenados", "HL", "Mantenimiento", "Mezcla"].map(
                   (header) => (
                     <th key={header} style={{ padding: "10px 8px", fontSize: 12, color: textSoft }}>
                       {header}
@@ -1677,7 +2194,7 @@ function AnalysisPanel({
             <tbody>
               {rowsWithIssues.length === 0 ? (
                 <tr>
-                  <td colSpan={10} style={{ padding: "14px 8px", color: textSoft }}>
+                  <td colSpan={9} style={{ padding: "14px 8px", color: textSoft }}>
                     No hay ciclos para mostrar con los filtros actuales.
                   </td>
                 </tr>
@@ -1693,9 +2210,10 @@ function AnalysisPanel({
                     <td style={{ padding: "10px 8px", fontSize: 13 }}>{getCycleDurationHours(cycle)}h</td>
                     <td style={{ padding: "10px 8px", fontSize: 13 }}>{getCycleDisplayName(cycle)}</td>
                     <td style={{ padding: "10px 8px", fontSize: 13 }}>{cycle.ccts || "-"}</td>
-                    <td style={{ padding: "10px 8px", fontSize: 13 }}>{cycle.bbts || "-"}</td>
+                    <td style={{ padding: "10px 8px", fontSize: 13 }}>
+                      {formatCycleFillDetails(cycle.llenados) || "-"}
+                    </td>
                     <td style={{ padding: "10px 8px", fontSize: 13 }}>{cycle.cantidadHl || "-"}</td>
-                    <td style={{ padding: "10px 8px", fontSize: 13 }}>{cycle.lineaEnvasado || "-"}</td>
                     <td style={{ padding: "10px 8px", fontSize: 13 }}>
                       {[
                         cycle.mantenimientoProgramado ? "Programado" : "",
@@ -1738,6 +2256,8 @@ function InstructionsPanel() {
         <li>Usa los bordes del bloque para cambiar inicio o fin.</li>
         <li>Si un ciclo choca con otros, la app los reacomoda automaticamente hacia adelante.</li>
         <li>Los ciclos pueden cruzar medianoche y continuar en la siguiente semana.</li>
+        <li>Dentro del modal puedes ordenar varios BBTs, enlazar lineas y definir la hora de inicio y fin de cada llenado.</li>
+        <li>Si un llenado BBT termina despues del fin del ciclo, el ciclo se extiende automaticamente.</li>
         <li>Desde Admin puedes manejar productos, colores, CCTs, BBTs y lineas sin tocar codigo.</li>
         <li>Puedes exportar la semana visible a Excel o PDF.</li>
       </ul>
@@ -1882,18 +2402,17 @@ export default function App() {
         let target = current;
 
         if (interaction.mode === "drag") {
-          const duration = interaction.originalEndSlot - interaction.originalStartSlot;
           const nextStart = Math.max(0, interaction.originalStartSlot + delta);
-          target = applyRangeToCycle(current, nextStart, nextStart + duration);
+          target = shiftCycle(current, nextStart);
         } else if (interaction.mode === "resize-start") {
           const nextStart = Math.max(
             0,
             Math.min(interaction.originalStartSlot + delta, interaction.originalEndSlot - 1)
           );
-          target = applyRangeToCycle(current, nextStart, interaction.originalEndSlot);
+          target = ensureCycleCoversFills(applyRangeToCycle(current, nextStart, interaction.originalEndSlot));
         } else {
           const nextEnd = Math.max(interaction.originalStartSlot + 1, interaction.originalEndSlot + delta);
-          target = applyRangeToCycle(current, interaction.originalStartSlot, nextEnd);
+          target = ensureCycleCoversFills(applyRangeToCycle(current, interaction.originalStartSlot, nextEnd));
         }
 
         const result = arrangeCyclesWithPriority(
@@ -1983,11 +2502,11 @@ export default function App() {
     const { endSlot } = getCycleBounds(original);
     const nextStart = findNextAvailableStart(cycles, duration, endSlot);
     const newId = nextId.current;
-    const duplicated: Cycle = {
+    const duplicated = shiftCycle({
       ...original,
       id: newId,
-      ...rangeFromSlots(nextStart, nextStart + duration),
-    };
+      llenados: original.llenados.map((fill) => createCycleFillTarget(fill)),
+    }, nextStart);
 
     nextId.current += 1;
     setCycles((previous) => sortCycles([...previous, duplicated]));
@@ -2072,8 +2591,9 @@ export default function App() {
       Producto: getCycleDisplayName(cycle),
       CCTs: cycle.ccts,
       BBTs: cycle.bbts,
+      "Detalle BBT / linea / horario": formatCycleFillDetails(cycle.llenados),
       "Cantidad (hl)": cycle.cantidadHl,
-      "Linea de envasado": cycle.lineaEnvasado,
+      "Lineas de envasado": cycle.lineaEnvasado,
       "Mant. programado": cycle.mantenimientoProgramado ? "Si" : "No",
       "Mant. correctivo": cycle.mantenimientoCorrectivo ? "Si" : "No",
       Mezcla: cycle.mezcla ? "Si" : "No",
@@ -2104,9 +2624,8 @@ export default function App() {
         "Duracion",
         "Producto",
         "CCTs",
-        "BBTs",
+        "Llenados",
         "Cantidad (hl)",
-        "Linea",
         "Mantenimiento",
         "Mezcla",
       ]],
@@ -2116,9 +2635,8 @@ export default function App() {
         `${getCycleDurationHours(cycle)}h`,
         getCycleDisplayName(cycle),
         cycle.ccts,
-        cycle.bbts,
+        formatCycleFillDetails(cycle.llenados),
         cycle.cantidadHl,
-        cycle.lineaEnvasado,
         [
           cycle.mantenimientoProgramado ? "Programado" : "",
           cycle.mantenimientoCorrectivo ? "Correctivo" : "",
@@ -2286,7 +2804,12 @@ export default function App() {
                 if (!cycle) return null;
 
                 const showMeta = segment.endHour - segment.startHour >= 4;
-                const compactMeta = [cycle.ccts, cycle.cantidadHl ? `${cycle.cantidadHl} hl` : "", cycle.lineaEnvasado]
+                const compactMeta = [
+                  cycle.ccts,
+                  cycle.bbts,
+                  cycle.cantidadHl ? `${cycle.cantidadHl} hl` : "",
+                  cycle.lineaEnvasado,
+                ]
                   .filter(Boolean)
                   .join(" | ");
                 const segmentLabel = `${segment.continuesBefore ? "< " : ""}${getCycleDisplayName(cycle)}${

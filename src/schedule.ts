@@ -1,3 +1,13 @@
+export type CycleFillTarget = {
+  id: string;
+  bbt: string;
+  lineas: string[];
+  startDate: string;
+  startHour: number;
+  endDate: string;
+  endHour: number;
+};
+
 export type Cycle = {
   id: number;
   startDate: string;
@@ -8,6 +18,7 @@ export type Cycle = {
   color: string;
   aseo: boolean;
   ccts: string;
+  llenados: CycleFillTarget[];
   bbts: string;
   cantidadHl: string;
   lineaEnvasado: string;
@@ -127,8 +138,22 @@ export function getCycleBounds(cycle: Pick<Cycle, "startDate" | "startHour" | "e
   };
 }
 
+export function getFillBounds(
+  fill: Pick<CycleFillTarget, "startDate" | "startHour" | "endDate" | "endHour">
+): CycleBounds {
+  return {
+    startSlot: slotFromDateHour(fill.startDate, fill.startHour),
+    endSlot: slotFromDateHour(fill.endDate, fill.endHour),
+  };
+}
+
 export function getCycleDurationHours(cycle: Pick<Cycle, "startDate" | "startHour" | "endDate" | "endHour">) {
   const { startSlot, endSlot } = getCycleBounds(cycle);
+  return endSlot - startSlot;
+}
+
+export function getFillDurationHours(fill: Pick<CycleFillTarget, "startDate" | "startHour" | "endDate" | "endHour">) {
+  const { startSlot, endSlot } = getFillBounds(fill);
   return endSlot - startSlot;
 }
 
@@ -139,9 +164,27 @@ export function applyRangeToCycle(cycle: Cycle, startSlot: number, endSlot: numb
   };
 }
 
+export function applyRangeToFill(fill: CycleFillTarget, startSlot: number, endSlot: number) {
+  return {
+    ...fill,
+    ...rangeFromSlots(startSlot, endSlot),
+  };
+}
+
+export function shiftFill(fill: CycleFillTarget, deltaSlots: number) {
+  const { startSlot, endSlot } = getFillBounds(fill);
+  return applyRangeToFill(fill, startSlot + deltaSlots, endSlot + deltaSlots);
+}
+
 export function shiftCycle(cycle: Cycle, newStartSlot: number) {
+  const { startSlot } = getCycleBounds(cycle);
   const duration = getCycleDurationHours(cycle);
-  return applyRangeToCycle(cycle, newStartSlot, newStartSlot + duration);
+  const deltaSlots = newStartSlot - startSlot;
+
+  return {
+    ...applyRangeToCycle(cycle, newStartSlot, newStartSlot + duration),
+    llenados: cycle.llenados.map((fill) => shiftFill(fill, deltaSlots)),
+  };
 }
 
 export function sortCycles(cycles: Cycle[]) {
