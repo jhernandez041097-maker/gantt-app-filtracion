@@ -92,7 +92,11 @@ type TabKey = "plan" | "analysis" | "admin" | "instructions";
 type PlanViewKey = "week" | "day";
 
 const AUTH_STORAGE_KEY = "gantt-filtracion-auth-v1";
-const API_BASE_URL = "http://localhost:3001";
+const API_BASE_URL = (() => {
+  const configuredUrl = import.meta.env.VITE_API_BASE_URL?.trim();
+  const baseUrl = configuredUrl || (window.location.hostname === "localhost" ? "http://localhost:3001" : "");
+  return baseUrl.replace(/\/+$/, "");
+})();
 const HOUR_WIDTH_BASE = 56;
 const MIN_ZOOM = 0.4;
 const MAX_ZOOM = 2.2;
@@ -170,6 +174,14 @@ async function readApiError(response: Response) {
   } catch {
     return "Ocurrio un error.";
   }
+}
+
+function getErrorMessage(caughtError: unknown, fallback: string) {
+  if (caughtError instanceof TypeError) {
+    return "No se pudo conectar con el backend. Configura VITE_API_BASE_URL con la URL del servidor API.";
+  }
+
+  return caughtError instanceof Error ? caughtError.message : fallback;
 }
 
 function createCycleFillTarget(
@@ -335,6 +347,7 @@ function getHydratedCycleFillTargets(
       lineas: legacyLinea ? [legacyLinea] : [],
     }, fallbackRange),
   ];
+
 }
 
 function getSelectOptions(options: string[], currentValue: string) {
@@ -2390,7 +2403,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSessio
       localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(session));
       onAuthenticated(session);
     } catch (caughtError) {
-      setError(caughtError instanceof Error ? caughtError.message : "No se pudo iniciar sesion.");
+      setError(getErrorMessage(caughtError, "No se pudo iniciar sesion."));
     } finally {
       setLoading(false);
     }
@@ -2567,7 +2580,7 @@ export default function App() {
 
         setCycles([]);
         setConfig(DEFAULT_CONFIG);
-        setPlanError(caughtError instanceof Error ? caughtError.message : "No se pudo cargar el plan.");
+        setPlanError(getErrorMessage(caughtError, "No se pudo cargar el plan."));
       } finally {
         if (!cancelled) setStorageReady(true);
       }
@@ -2604,7 +2617,7 @@ export default function App() {
 
         setPlanError("");
       } catch (caughtError) {
-        setPlanError(caughtError instanceof Error ? caughtError.message : "No se pudo guardar el plan.");
+        setPlanError(getErrorMessage(caughtError, "No se pudo guardar el plan."));
       }
     }, 700);
 

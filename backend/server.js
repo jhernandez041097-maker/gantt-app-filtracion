@@ -6,12 +6,25 @@ const jwt = require("jsonwebtoken");
 const app = express();
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
+const allowedOrigins = (process.env.CORS_ORIGINS || "http://localhost:5173,http://127.0.0.1:5173")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
 const users = [];
 const plansByUserId = new Map();
 let nextUserId = 1;
 
-app.use(cors({ origin: ["http://localhost:5173", "http://127.0.0.1:5173"] }));
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Allow server-to-server requests and local tooling without Origin header.
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error("Origen no permitido por CORS."));
+    },
+  })
+);
 app.use(express.json({ limit: "5mb" }));
 
 function createToken(user) {
