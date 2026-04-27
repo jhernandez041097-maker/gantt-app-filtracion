@@ -77,26 +77,12 @@ type NoticeState = null | {
   tone: "info" | "success";
 };
 
-type AuthUser = {
-  id: number;
-  name: string;
-  email: string;
-};
-
-type AuthSession = {
-  token: string;
-  user: AuthUser;
-};
-
 type TabKey = "plan" | "analysis" | "admin" | "instructions";
 type PlanViewKey = "week" | "day";
 
-const AUTH_STORAGE_KEY = "gantt-filtracion-auth-v1";
-const API_BASE_URL = (() => {
-  const configuredUrl = import.meta.env.VITE_API_BASE_URL?.trim();
-  const baseUrl = configuredUrl || (window.location.hostname === "localhost" ? "http://localhost:3001" : "");
-  return baseUrl.replace(/\/+$/, "");
-})();
+/** Guardado solo en el navegador (sin autenticacion / sin backend obligatorio). */
+const PLAN_LOCAL_STORAGE_KEY = "gantt-filtracion-plan-v1";
+const GANTT_ROW_HEIGHT = 120;
 const HOUR_WIDTH_BASE = 56;
 const MIN_ZOOM = 0.4;
 const MAX_ZOOM = 2.2;
@@ -153,35 +139,40 @@ function readStringArrayOrNull(value: unknown) {
   return normalizeStringList(value.filter((item): item is string => typeof item === "string"));
 }
 
-function readStoredAuth() {
+function readPlanFromBrowserStorage(): {
+  cycles: Cycle[];
+  config: ConfigState;
+  activeWeekStart: string;
+} | null {
+  if (typeof window === "undefined") return null;
+
   try {
-    const saved = localStorage.getItem(AUTH_STORAGE_KEY);
-    if (!saved) return null;
+    const raw = window.localStorage.getItem(PLAN_LOCAL_STORAGE_KEY);
+    if (!raw) return null;
 
-    const parsed = JSON.parse(saved) as Partial<AuthSession>;
-    if (!parsed.token || !parsed.user?.email) return null;
+    const parsed = JSON.parse(raw) as {
+      cycles?: Record<string, unknown>[];
+      config?: Partial<ConfigState>;
+      activeWeekStart?: string;
+    };
 
-    return parsed as AuthSession;
+    const storedCycles = Array.isArray(parsed.cycles)
+      ? sortCycles(parsed.cycles.map((cycle) => hydrateCycle(cycle)))
+      : [];
+
+    const storedWeekStart =
+      typeof parsed.activeWeekStart === "string"
+        ? getStartOfWeek(parsed.activeWeekStart)
+        : getStartOfWeek(new Date());
+
+    return {
+      cycles: storedCycles,
+      config: buildConfigState(parsed.config ?? undefined),
+      activeWeekStart: storedWeekStart,
+    };
   } catch {
     return null;
   }
-}
-
-async function readApiError(response: Response) {
-  try {
-    const data = await response.json();
-    return typeof data.message === "string" ? data.message : "Ocurrio un error.";
-  } catch {
-    return "Ocurrio un error.";
-  }
-}
-
-function getErrorMessage(caughtError: unknown, fallback: string) {
-  if (caughtError instanceof TypeError) {
-    return "No se pudo conectar con el backend. Configura VITE_API_BASE_URL con la URL del servidor API.";
-  }
-
-  return caughtError instanceof Error ? caughtError.message : fallback;
 }
 
 function createCycleFillTarget(
@@ -599,6 +590,29 @@ function formatCycleTooltip(cycle: Cycle) {
   if (cycle.notas) lines.push(`Notas: ${cycle.notas}`);
 
   return lines.join("\n");
+}
+
+function formatFillTimeRange(fill: CycleFillTarget) {
+  const endLabel = fill.endHour === 24 ? "24:00" : formatHour(fill.endHour);
+  return `${formatHour(fill.startHour)}-${endLabel}`;
+}
+
+function getFillsOverlappingDaySegment(
+  cycle: Cycle,
+  dayDate: string,
+  segment: { startHour: number; endHour: number }
+) {
+  if (isSpecialEventCycle(cycle)) return [];
+
+  const meaningful = getMeaningfulCycleFillTargets(cycle.llenados);
+  const dayStartSlot = slotFromDateHour(dayDate, 0);
+  const segmentStartSlot = dayStartSlot + segment.startHour;
+  const segmentEndSlot = dayStartSlot + segment.endHour;
+
+  return meaningful.filter((fill) => {
+    const fillBounds = getFillBounds(fill);
+    return fillBounds.endSlot > segmentStartSlot && fillBounds.startSlot < segmentEndSlot;
+  });
 }
 
 function incrementUsage(map: Record<string, number>, value: string) {
@@ -2370,130 +2384,12 @@ function InstructionsPanel() {
   );
 }
 
-function AuthScreen({ onAuthenticated }: { onAuthenticated: (session: AuthSession) => void }) {
-  const [mode, setMode] = useState<"login" | "register">("login");
-  const [name, setName] = useState("");
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
-
-  const submit = async (event: React.FormEvent) => {
-    event.preventDefault();
-    setError("");
-    setLoading(true);
-
-    try {
-      const endpoint = mode === "login" ? "/api/auth/login" : "/api/auth/register";
-      const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name,
-          email,
-          password,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(await readApiError(response));
-      }
-
-      const session = (await response.json()) as AuthSession;
-      localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(session));
-      onAuthenticated(session);
-    } catch (caughtError) {
-      setError(getErrorMessage(caughtError, "No se pudo iniciar sesion."));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  return (
-    <div
-      style={{
-        minHeight: "100vh",
-        background: appBg,
-        color: text,
-        display: "grid",
-        placeItems: "center",
-        padding: 20,
-        fontFamily: "Arial, sans-serif",
-      }}
-    >
-      <form onSubmit={submit} style={{ ...cardStyle(), width: 420, maxWidth: "100%", padding: 24 }}>
-        <div style={{ fontSize: 24, fontWeight: 700 }}>Plan de filtracion</div>
-        <div style={{ fontSize: 13, color: textSoft, marginTop: 6 }}>
-          {mode === "login" ? "Ingresa para cargar tu plan." : "Crea un usuario para guardar tu plan."}
-        </div>
-
-        {mode === "register" && (
-          <div style={{ marginTop: 16 }}>
-            <label style={{ fontSize: 12, color: textSoft }}>Nombre</label>
-            <input value={name} onChange={(event) => setName(event.target.value)} style={inputStyle} />
-          </div>
-        )}
-
-        <div style={{ marginTop: 16 }}>
-          <label style={{ fontSize: 12, color: textSoft }}>Email</label>
-          <input
-            type="email"
-            value={email}
-            onChange={(event) => setEmail(event.target.value)}
-            style={inputStyle}
-          />
-        </div>
-
-        <div style={{ marginTop: 16 }}>
-          <label style={{ fontSize: 12, color: textSoft }}>Password</label>
-          <input
-            type="password"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-            style={inputStyle}
-          />
-        </div>
-
-        {error && (
-          <div
-            style={{
-              marginTop: 14,
-              padding: "10px 12px",
-              borderRadius: 10,
-              background: "#fee2e2",
-              color: danger,
-              fontSize: 13,
-              fontWeight: 700,
-            }}
-          >
-            {error}
-          </div>
-        )}
-
-        <button type="submit" disabled={loading} style={{ ...buttonStyle(true), width: "100%", marginTop: 18 }}>
-          {loading ? "Procesando..." : mode === "login" ? "Iniciar sesion" : "Registrarme"}
-        </button>
-
-        <button
-          type="button"
-          onClick={() => {
-            setMode((currentMode) => (currentMode === "login" ? "register" : "login"));
-            setError("");
-          }}
-          style={{ ...buttonStyle(), width: "100%", marginTop: 10 }}
-        >
-          {mode === "login" ? "Crear cuenta" : "Ya tengo cuenta"}
-        </button>
-      </form>
-    </div>
-  );
-}
-
 export default function App() {
-  const [authSession, setAuthSession] = useState<AuthSession | null>(() => readStoredAuth());
-  const [cycles, setCycles] = useState<Cycle[]>([]);
-  const [config, setConfig] = useState<ConfigState>(DEFAULT_CONFIG);
-  const [activeWeekStart, setActiveWeekStart] = useState(getStartOfWeek(new Date()));
+  const persistedPlan = typeof window !== "undefined" ? readPlanFromBrowserStorage() : null;
+
+  const [cycles, setCycles] = useState<Cycle[]>(() => persistedPlan?.cycles ?? []);
+  const [config, setConfig] = useState<ConfigState>(() => persistedPlan?.config ?? DEFAULT_CONFIG);
+  const [activeWeekStart, setActiveWeekStart] = useState(() => persistedPlan?.activeWeekStart ?? getStartOfWeek(new Date()));
   const [planView, setPlanView] = useState<PlanViewKey>("week");
   const [selectedDayIndex, setSelectedDayIndex] = useState(getDayIndexFromDate(toDateInputValue(new Date())));
   const [zoom, setZoom] = useState(1);
@@ -2502,12 +2398,12 @@ export default function App() {
   const [interaction, setInteraction] = useState<InteractionState | null>(null);
   const [notice, setNotice] = useState<NoticeState>(null);
   const [weekPickerOpen, setWeekPickerOpen] = useState(false);
-  const [navigatorDate, setNavigatorDate] = useState(toDateInputValue(new Date()));
+  const [navigatorDate, setNavigatorDate] = useState(
+    () => persistedPlan?.activeWeekStart ?? toDateInputValue(new Date())
+  );
   const [navigatorHour, setNavigatorHour] = useState(new Date().getHours());
   const [pendingJump, setPendingJump] = useState<JumpTarget | null>(null);
   const [focusedDay, setFocusedDay] = useState<number | null>(null);
-  const [storageReady, setStorageReady] = useState(false);
-  const [planError, setPlanError] = useState("");
 
   const nextId = useRef(1);
   const dayScrollRefs = useRef<(HTMLDivElement | null)[]>([]);
@@ -2527,102 +2423,28 @@ export default function App() {
   const weekSegments = useMemo(() => getVisibleWeekSegments(cycles, activeWeekStart), [cycles, activeWeekStart]);
 
   useEffect(() => {
-    if (!authSession?.token) {
-      setStorageReady(false);
-      return;
-    }
-
-    let cancelled = false;
-
-    const loadPlan = async () => {
-      setStorageReady(false);
-      setPlanError("");
-
-      try {
-        const response = await fetch(`${API_BASE_URL}/api/plan`, {
-          headers: {
-            Authorization: `Bearer ${authSession.token}`,
-          },
-        });
-
-        if (!response.ok) {
-          if (response.status === 401) {
-            localStorage.removeItem(AUTH_STORAGE_KEY);
-            setAuthSession(null);
-          }
-
-          throw new Error(await readApiError(response));
-        }
-
-        const parsed = (await response.json()) as {
-          cycles?: Record<string, unknown>[];
-          config?: Partial<ConfigState> | null;
-          activeWeekStart?: string | null;
-        };
-
-        if (cancelled) return;
-
-        const storedCycles = Array.isArray(parsed.cycles)
-          ? sortCycles(parsed.cycles.map((cycle) => hydrateCycle(cycle)))
-          : [];
-        const storedWeekStart =
-          typeof parsed.activeWeekStart === "string"
-            ? getStartOfWeek(parsed.activeWeekStart)
-            : getStartOfWeek(new Date());
-
-        setCycles(storedCycles);
-        setConfig(buildConfigState(parsed.config ?? undefined));
-        setActiveWeekStart(storedWeekStart);
-        setNavigatorDate(storedWeekStart);
-        nextId.current = Math.max(0, ...storedCycles.map((cycle) => cycle.id)) + 1;
-      } catch (caughtError) {
-        if (cancelled) return;
-
-        setCycles([]);
-        setConfig(DEFAULT_CONFIG);
-        setPlanError(getErrorMessage(caughtError, "No se pudo cargar el plan."));
-      } finally {
-        if (!cancelled) setStorageReady(true);
-      }
-    };
-
-    loadPlan();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [authSession?.token]);
+    const maxId = cycles.length > 0 ? Math.max(...cycles.map((cycle) => cycle.id)) : 0;
+    nextId.current = maxId + 1;
+  }, []);
 
   useEffect(() => {
-    if (!storageReady || !authSession?.token) return;
-
-    const timeout = window.setTimeout(async () => {
+    const timeout = window.setTimeout(() => {
       try {
-        const response = await fetch(`${API_BASE_URL}/api/plan`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${authSession.token}`,
-          },
-          body: JSON.stringify({
+        localStorage.setItem(
+          PLAN_LOCAL_STORAGE_KEY,
+          JSON.stringify({
             cycles,
             config,
             activeWeekStart,
-          }),
-        });
-
-        if (!response.ok) {
-          throw new Error(await readApiError(response));
-        }
-
-        setPlanError("");
-      } catch (caughtError) {
-        setPlanError(getErrorMessage(caughtError, "No se pudo guardar el plan."));
+          })
+        );
+      } catch {
+        // Quota llena o modo privado: no bloquea la edicion.
       }
-    }, 700);
+    }, 500);
 
     return () => window.clearTimeout(timeout);
-  }, [cycles, config, activeWeekStart, storageReady, authSession?.token]);
+  }, [cycles, config, activeWeekStart]);
 
   useEffect(() => {
     if (!notice) return;
@@ -2964,50 +2786,19 @@ export default function App() {
     setNavigatorDate(addDays(activeWeekStart, nextDayIndex));
   };
 
-  const handleAuthenticated = (session: AuthSession) => {
-    setAuthSession(session);
-    setPlanError("");
-  };
+  const resetLocalPlan = () => {
+    if (!window.confirm("Se borrara el plan guardado en este navegador. Continuar?")) return;
 
-  const logout = () => {
-    localStorage.removeItem(AUTH_STORAGE_KEY);
-    setAuthSession(null);
+    localStorage.removeItem(PLAN_LOCAL_STORAGE_KEY);
     setCycles([]);
     setConfig(DEFAULT_CONFIG);
-    setActiveWeekStart(getStartOfWeek(new Date()));
+    const week = getStartOfWeek(new Date());
+    setActiveWeekStart(week);
     setNavigatorDate(toDateInputValue(new Date()));
-    setStorageReady(false);
-    setPlanError("");
+    setSelectedDayIndex(getDayIndexFromDate(toDateInputValue(new Date())));
+    setModal(null);
     nextId.current = 1;
   };
-
-  if (!authSession) {
-    return <AuthScreen onAuthenticated={handleAuthenticated} />;
-  }
-
-  if (!storageReady) {
-    return (
-      <div
-        style={{
-          minHeight: "100vh",
-          background: appBg,
-          color: text,
-          padding: 20,
-          fontFamily: "Arial, sans-serif",
-          display: "grid",
-          placeItems: "center",
-        }}
-      >
-        <div style={{ ...cardStyle(), padding: 24, width: 420, maxWidth: "100%", textAlign: "center" }}>
-          <div style={{ fontSize: 22, fontWeight: 700 }}>Cargando plan</div>
-          <div style={{ fontSize: 13, color: textSoft, marginTop: 8 }}>{authSession.user.email}</div>
-          <button type="button" onClick={logout} style={{ ...buttonStyle(), marginTop: 18 }}>
-            Cerrar sesion
-          </button>
-        </div>
-      </div>
-    );
-  }
 
   const selectedDayDate = addDays(activeWeekStart, selectedDayIndex);
   const selectedDayStartSlot = slotFromDateHour(selectedDayDate, 0);
@@ -3094,7 +2885,7 @@ export default function App() {
               style={{
                 position: "relative",
                 display: "flex",
-                height: 74,
+                height: GANTT_ROW_HEIGHT,
                 cursor: "crosshair",
               }}
               onClick={(event) => {
@@ -3123,18 +2914,19 @@ export default function App() {
                 const cycle = cycleMap.get(segment.cycleId);
                 if (!cycle) return null;
 
-                const showMeta = segment.endHour - segment.startHour >= 4;
-                const compactMeta = [
-                  cycle.ccts,
-                  cycle.bbts,
-                  cycle.cantidadHl ? `${cycle.cantidadHl} hl` : "",
-                  cycle.lineaEnvasado,
-                ]
-                  .filter(Boolean)
-                  .join(" | ");
                 const segmentLabel = `${segment.continuesBefore ? "< " : ""}${getCycleDisplayName(cycle)}${
                   segment.continuesAfter ? " >" : ""
                 }`;
+                const overlapFills = getFillsOverlappingDaySegment(cycle, dayDate, segment);
+                const fallbackSummaryLines =
+                  overlapFills.length === 0 && !isSpecialEventCycle(cycle)
+                    ? [
+                        cycle.ccts.trim() ? `CCT: ${cycle.ccts}` : "",
+                        cycle.bbts.trim() ? `BBT: ${cycle.bbts}` : "",
+                        cycle.lineaEnvasado.trim() ? `Lineas: ${cycle.lineaEnvasado}` : "",
+                        cycle.cantidadHl.trim() ? `Cantidad: ${cycle.cantidadHl} hl` : "",
+                      ].filter(Boolean)
+                    : [];
 
                 return (
                   <div
@@ -3145,8 +2937,8 @@ export default function App() {
                       position: "absolute",
                       left: segment.startHour * hourWidth,
                       width: Math.max((segment.endHour - segment.startHour) * hourWidth, 18),
-                      top: 8,
-                      height: 58,
+                      top: 6,
+                      height: GANTT_ROW_HEIGHT - 12,
                       background: cycle.color,
                       color: "#fff",
                       borderRadius: 10,
@@ -3189,37 +2981,92 @@ export default function App() {
                         background: "transparent",
                         color: "inherit",
                         textAlign: "left",
-                        padding: "10px 18px 10px 30px",
+                        padding: "8px 16px 6px 30px",
                         cursor: "pointer",
                         display: "flex",
                         flexDirection: "column",
-                        justifyContent: "center",
-                        gap: 4,
+                        justifyContent: "flex-start",
+                        gap: 3,
                       }}
                     >
                       <span
                         style={{
                           fontWeight: 700,
+                          fontSize: 12,
                           overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
+                          wordBreak: "break-word",
+                          lineHeight: 1.2,
+                          flexShrink: 0,
+                          maxHeight: 30,
+                          display: "block",
                         }}
                       >
                         {segmentLabel}
                       </span>
-                      {showMeta && compactMeta && (
-                        <span
-                          style={{
-                            fontSize: 10,
-                            opacity: 0.95,
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                          }}
-                        >
-                          {compactMeta}
-                        </span>
-                      )}
+                      <div
+                        style={{
+                          flex: 1,
+                          minHeight: 0,
+                          overflow: "auto",
+                          marginTop: 2,
+                          fontSize: 9,
+                          lineHeight: 1.35,
+                          fontWeight: 600,
+                          opacity: 0.95,
+                          wordBreak: "break-word",
+                        }}
+                      >
+                        {isSpecialEventCycle(cycle) ? (
+                          cycle.notas.trim() ? (
+                            <div>{cycle.notas}</div>
+                          ) : null
+                        ) : overlapFills.length > 0 ? (
+                          overlapFills.map((fill, fillIdx) => (
+                            <div
+                              key={fill.id}
+                              style={{
+                                marginTop: fillIdx === 0 ? 0 : 5,
+                                paddingLeft: 6,
+                                borderLeft: "3px solid rgba(255,255,255,0.45)",
+                              }}
+                            >
+                              <div style={{ opacity: 0.95 }}>{formatFillTimeRange(fill)}</div>
+                              {fill.cct.trim() ? (
+                                <div>
+                                  <span style={{ opacity: 0.75 }}>CCT </span>
+                                  {fill.cct}
+                                </div>
+                              ) : null}
+                              {fill.bbt.trim() ? (
+                                <div>
+                                  <span style={{ opacity: 0.75 }}>BBT </span>
+                                  {fill.bbt}
+                                </div>
+                              ) : null}
+                              {fill.lineas.length > 0 ? (
+                                <div>
+                                  <span style={{ opacity: 0.75 }}>Lin </span>
+                                  {normalizeStringList(fill.lineas).join(", ")}
+                                </div>
+                              ) : null}
+                              {fill.cantidadHl.trim() ? (
+                                <div>
+                                  <span style={{ opacity: 0.75 }}>Hl </span>
+                                  {fill.cantidadHl}
+                                </div>
+                              ) : null}
+                            </div>
+                          ))
+                        ) : fallbackSummaryLines.length > 0 ? (
+                          fallbackSummaryLines.map((line, idx) => (
+                            <div key={`${idx}-${line}`} style={{ marginTop: 2 }}>
+                              {line}
+                            </div>
+                          ))
+                        ) : (
+                          <div style={{ fontWeight: 500, opacity: 0.88 }}>(Sin detalle de llenado)</div>
+                        )}
+                      </div>
                     </button>
 
                     <button
@@ -3230,9 +3077,9 @@ export default function App() {
                       style={{
                         position: "absolute",
                         left: 12,
-                        top: 18,
+                        top: Math.min(52, Math.max(10, Math.floor(GANTT_ROW_HEIGHT * 0.32))),
                         width: 14,
-                        height: 22,
+                        height: 26,
                         borderRadius: 7,
                         border: "none",
                         background: "rgba(15,23,42,0.28)",
@@ -3300,10 +3147,7 @@ export default function App() {
             PLAN DE PRODUCCION DE FILTRACION CERVECERIA DEL ATLANTICO
           </div>
           <div style={{ fontSize: 13, color: textSoft }}>
-            Plan semanal dinamico con ciclos continuos y guardado por usuario
-          </div>
-          <div style={{ fontSize: 12, color: textSoft, marginTop: 4 }}>
-            Sesion: {authSession.user.name} | {authSession.user.email}
+            Plan semanal dinamico con ciclos continuos — guardado en este equipo (navegador)
           </div>
         </div>
 
@@ -3320,26 +3164,11 @@ export default function App() {
           <button onClick={() => setTab("instructions")} style={buttonStyle(tab === "instructions")}>
             Instrucciones
           </button>
-          <button onClick={logout} style={buttonStyle()}>
-            Cerrar sesion
+          <button onClick={resetLocalPlan} style={buttonStyle()}>
+            Limpiar plan local
           </button>
         </div>
       </div>
-
-      {planError && (
-        <div
-          style={{
-            ...cardStyle(),
-            padding: "12px 16px",
-            marginBottom: 16,
-            background: "#fff7ed",
-            color: "#9a3412",
-            fontWeight: 700,
-          }}
-        >
-          {planError}
-        </div>
-      )}
 
       {tab === "plan" && (
         <>
