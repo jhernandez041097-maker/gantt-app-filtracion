@@ -7,6 +7,7 @@ import {
   HOURS,
   addDays,
   applyRangeToCycle,
+  applyRangeToFill,
   arrangeCyclesWithPriority,
   findNextAvailableStart,
   formatDateLabel,
@@ -22,6 +23,7 @@ import {
   getVisibleWeekSegments,
   rangeFromSlots,
   shiftCycle,
+  shiftFill,
   slotFromDateHour,
   sortCycles,
   toDateInputValue,
@@ -303,6 +305,63 @@ function ensureCycleCoversFills<T extends Pick<CycleDraft, "startDate" | "startH
     ...cycle,
     ...getCycleRangeIncludingFills(cycle, getMeaningfulCycleFillTargets(cycle.llenados)),
   };
+}
+
+/** Recorta un llenado al rango [cycleStartSlot, cycleEndSlot) en slots absolutos. */
+function clipFillToCycleRange(fill: CycleFillTarget, cycleStartSlot: number, cycleEndSlot: number): CycleFillTarget {
+  const fb = getFillBounds(fill);
+  const nextStart = Math.max(fb.startSlot, cycleStartSlot);
+  const nextEnd = Math.min(fb.endSlot, cycleEndSlot);
+
+  if (nextStart < nextEnd) {
+    return applyRangeToFill(fill, nextStart, nextEnd);
+  }
+
+  const tuck = Math.max(cycleStartSlot, Math.min(cycleEndSlot - 1, fb.startSlot));
+  const tuckEnd = Math.min(tuck + 1, cycleEndSlot);
+  return applyRangeToFill(fill, tuck, Math.max(tuckEnd, tuck + 1));
+}
+
+/** Al arrastrar el borde izquierdo del ciclo, los llenados se mueven igual que el bloque (como en shiftCycle). */
+function resizeCycleStartWithShifts(cycle: Cycle, newStartSlot: number): Cycle {
+  const { startSlot, endSlot } = getCycleBounds(cycle);
+  const clampedStart = Math.max(0, Math.min(newStartSlot, endSlot - 1));
+  const delta = clampedStart - startSlot;
+
+  const next: Cycle = {
+    ...applyRangeToCycle(cycle, clampedStart, endSlot),
+    llenados: cycle.llenados.map((fill) => shiftFill(fill, delta)),
+  };
+
+  return syncCycleFillFields(next) as Cycle;
+}
+
+/** Al arrastrar el borde derecho: recorta o extiende llenados para coincidir con el nuevo fin del ciclo. */
+function resizeCycleEndWithFills(cycle: Cycle, newEndSlot: number): Cycle {
+  const { startSlot } = getCycleBounds(cycle);
+  const clampedEnd = Math.max(startSlot + 1, newEndSlot);
+
+  let updatedFills = cycle.llenados.map((fill) => clipFillToCycleRange(fill, startSlot, clampedEnd));
+
+  const meaningful = getMeaningfulCycleFillTargets(updatedFills);
+  if (meaningful.length > 0) {
+    const lastFill = meaningful[meaningful.length - 1];
+    const lb = getFillBounds(lastFill);
+    if (clampedEnd > lb.endSlot) {
+      updatedFills = updatedFills.map((fill) =>
+        fill.id === lastFill.id ? applyRangeToFill(lastFill, lb.startSlot, clampedEnd) : fill
+      );
+    }
+  }
+
+  let next: Cycle = {
+    ...cycle,
+    ...rangeFromSlots(startSlot, clampedEnd),
+    llenados: updatedFills,
+  };
+
+  next = syncCycleFillFields(next) as Cycle;
+  return ensureCycleCoversFills(next) as Cycle;
 }
 
 function getHydratedCycleFillTargets(
@@ -824,8 +883,10 @@ function CycleModal({
       : null;
 
   const [form, setForm] = useState<CycleDraft>(() => createEmptyCycle(config));
+  const [saveError, setSaveError] = useState("");
 
   useEffect(() => {
+    setSaveError("");
     if (!openState) return;
 
     if (existing) {
@@ -869,6 +930,10 @@ function CycleModal({
       );
     }
   }, [openState, existing, config]);
+
+  useEffect(() => {
+    setSaveError("");
+  }, [form]);
 
   if (!openState) return null;
 
@@ -1025,10 +1090,11 @@ function CycleModal({
     const nextForm = syncCycleFillFields(form);
     const error = validateCycle(nextForm);
     if (error) {
-      alert(error);
+      setSaveError(error);
       return;
     }
 
+    setSaveError("");
     onSave(nextForm, existing?.id);
   };
 
@@ -1637,13 +1703,31 @@ function CycleModal({
               </div>
             )}
           </div>
-          <div style={{ display: "flex", gap: 10 }}>
-            <button onClick={onClose} style={buttonStyle()}>
-              Cancelar
-            </button>
-            <button onClick={save} style={buttonStyle(true)}>
-              Guardar
-            </button>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10, alignItems: "stretch" }}>
+            {saveError ? (
+              <div
+                role="alert"
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  background: "#fee2e2",
+                  color: danger,
+                  fontSize: 13,
+                  fontWeight: 600,
+                  lineHeight: 1.45,
+                }}
+              >
+                {saveError}
+              </div>
+            ) : null}
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
+              <button onClick={onClose} style={buttonStyle()}>
+                Cancelar
+              </button>
+              <button onClick={save} style={buttonStyle(true)}>
+                Guardar
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -1750,10 +1834,21 @@ function AdminPanel({
   usageMaps: UsageMaps;
 }) {
   const [newColor, setNewColor] = useState("#3b82f6");
+  const [adminNotice, setAdminNotice] = useState<null | { message: string; tone: "error" }>(null);
+
+  useEffect(() => {
+    if (!adminNotice) return;
+
+    const timeout = window.setTimeout(() => setAdminNotice(null), 7000);
+    return () => window.clearTimeout(timeout);
+  }, [adminNotice]);
 
   const guardRemoval = (label: string, value: string, usageCount: number, remove: () => void) => {
     if (usageCount > 0) {
-      alert(`No puedes eliminar ${label} "${value}" porque esta en uso en ${usageCount} ciclo(s).`);
+      setAdminNotice({
+        message: `No puedes eliminar ${label} "${value}" porque esta en uso en ${usageCount} ciclo(s).`,
+        tone: "error",
+      });
       return;
     }
 
@@ -1762,6 +1857,22 @@ function AdminPanel({
 
   return (
     <div style={{ display: "grid", gap: 18 }}>
+      {adminNotice && (
+        <div
+          role="alert"
+          style={{
+            ...cardStyle(),
+            padding: "12px 16px",
+            background: adminNotice.tone === "error" ? "#fee2e2" : primarySoft,
+            color: adminNotice.tone === "error" ? danger : text,
+            fontWeight: 600,
+            fontSize: 13,
+            lineHeight: 1.45,
+          }}
+        >
+          {adminNotice.message}
+        </div>
+      )}
       <ConfigListSection
         title="Productos"
         items={config.productos}
@@ -1775,7 +1886,7 @@ function AdminPanel({
         }
         onRemove={(value) => {
           if (config.productos.length <= 1) {
-            alert("Debe quedar al menos un producto configurado.");
+            setAdminNotice({ message: "Debe quedar al menos un producto configurado.", tone: "error" });
             return;
           }
 
@@ -1853,7 +1964,7 @@ function AdminPanel({
               <button
                 onClick={() => {
                   if (config.colores.length <= 1) {
-                    alert("Debe quedar al menos un color configurado.");
+                    setAdminNotice({ message: "Debe quedar al menos un color configurado.", tone: "error" });
                     return;
                   }
 
@@ -2506,10 +2617,10 @@ export default function App() {
             0,
             Math.min(interaction.originalStartSlot + delta, interaction.originalEndSlot - 1)
           );
-          target = ensureCycleCoversFills(applyRangeToCycle(current, nextStart, interaction.originalEndSlot));
+          target = resizeCycleStartWithShifts(current, nextStart);
         } else {
           const nextEnd = Math.max(interaction.originalStartSlot + 1, interaction.originalEndSlot + delta);
-          target = ensureCycleCoversFills(applyRangeToCycle(current, interaction.originalStartSlot, nextEnd));
+          target = resizeCycleEndWithFills(current, nextEnd);
         }
 
         const result = arrangeCyclesWithPriority(
